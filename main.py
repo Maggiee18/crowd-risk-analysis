@@ -89,7 +89,10 @@ class CrowdRiskSystem:
             'alerts': {
                 'risk_threshold': 0.7,
                 'anomaly_threshold': 0.6,
-                'enable_callbacks': True
+                'enable_callbacks': True,
+                'capacity_limit': 30,
+                'capacity_alert_ratio': 0.8,
+                'rising_trend_min_slope': 0.5
             },
             'output': {
                 'save_video': False,
@@ -190,7 +193,10 @@ class CrowdRiskSystem:
             # Initialize alert system
             self.alert_system = AlertSystem(
                 risk_threshold=self.config['alerts']['risk_threshold'],
-                anomaly_threshold=self.config['alerts']['anomaly_threshold']
+                anomaly_threshold=self.config['alerts']['anomaly_threshold'],
+                capacity_limit=self.config['alerts'].get('capacity_limit', 30),
+                alert_ratio=self.config['alerts'].get('capacity_alert_ratio', 0.8),
+                trend_min_slope=self.config['alerts'].get('rising_trend_min_slope', 0.5)
             )
             
             # Initialize performance monitor

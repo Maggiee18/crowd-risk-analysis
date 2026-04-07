@@ -27,7 +27,10 @@
   "alerts": {
     "risk_threshold": 0.7,
     "anomaly_threshold": 0.6,
-    "enable_callbacks": true
+    "enable_callbacks": true,
+    "capacity_limit": 30,
+    "capacity_alert_ratio": 0.8,
+    "rising_trend_min_slope": 0.5
   },
   "output": {
     "save_video": false,

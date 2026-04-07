@@ -23,6 +23,7 @@ from detector import PeopleDetector
 from analyzer import CrowdAnalyzer
 from predictor import RiskPredictor, EnsemblePredictor
 from anomaly_detector import AnomalyDetector
+from optimizer import AlertSystem
 from utils import save_json, load_json, get_timestamp
 
 app = Flask(__name__)
@@ -34,9 +35,11 @@ analyzer = None
 risk_predictor = None
 anomaly_detector = None
 ensemble_predictor = None
+alert_system = None
 current_frame = None
 current_detections = []
 current_features = {}
+current_alerts = []
 system_status = {
     'initialized': False,
     'processing': False,
@@ -50,7 +53,7 @@ processing_lock = threading.Lock()
 
 def initialize_system():
     """Initialize all system components"""
-    global detector, analyzer, risk_predictor, anomaly_detector, ensemble_predictor, system_status
+    global detector, analyzer, risk_predictor, anomaly_detector, ensemble_predictor, alert_system, system_status
     
     try:
         # Initialize components
@@ -59,6 +62,13 @@ def initialize_system():
         risk_predictor = RiskPredictor(model_type='random_forest')
         anomaly_detector = AnomalyDetector(method='isolation_forest')
         ensemble_predictor = EnsemblePredictor()
+        alert_system = AlertSystem(
+            risk_threshold=0.7,
+            anomaly_threshold=0.6,
+            capacity_limit=30,
+            alert_ratio=0.8,
+            trend_min_slope=0.5
+        )
         
         # Try to load pre-trained models
         model_path = os.path.join(os.path.dirname(__file__), '..', 'models')
@@ -143,7 +153,7 @@ def process_frame():
     Process a single frame for people detection and analysis
     Expects base64 encoded image
     """
-    global current_frame, current_detections, current_features, system_status
+    global current_frame, current_detections, current_features, current_alerts, system_status
     
     try:
         with processing_lock:
@@ -199,6 +209,12 @@ def process_frame():
             current_features = features
             system_status['total_frames_processed'] += 1
             system_status['last_update'] = datetime.now().isoformat()
+
+            # Alerts
+            alerts = []
+            if alert_system:
+                alerts = alert_system.evaluate_risk(risk_result, anomaly_result, features)
+            current_alerts = alerts
             
             # Prepare response
             response = {
@@ -214,6 +230,7 @@ def process_frame():
                 },
                 'risk_prediction': risk_result,
                 'anomaly_detection': anomaly_result,
+                'alerts': alerts,
                 'timestamp': datetime.now().isoformat()
             }
             
@@ -412,10 +429,10 @@ def train_model():
 @app.route('/api/alerts', methods=['GET'])
 def get_alerts():
     """Get current alerts based on risk level and anomalies"""
-    alerts = []
+    alerts = list(current_alerts)
     
-    # Check current risk level
-    if risk_predictor and risk_predictor.is_trained:
+    # Fallback evaluation using latest features
+    if not alerts and risk_predictor and risk_predictor.is_trained:
         feature_vector = analyzer.get_feature_vector()
         if len(feature_vector) > 0:
             risk_level, confidence = risk_predictor.predict(feature_vector)
@@ -435,8 +452,7 @@ def get_alerts():
                     'timestamp': datetime.now().isoformat()
                 })
     
-    # Check anomalies
-    if anomaly_detector and anomaly_detector.is_trained:
+    if not alerts and anomaly_detector and anomaly_detector.is_trained:
         feature_vector = analyzer.get_feature_vector()
         if len(feature_vector) > 0:
             is_anomaly, anomaly_score, details = anomaly_detector.detect_anomaly(feature_vector)
@@ -448,6 +464,35 @@ def get_alerts():
                     'severity': 'warning',
                     'timestamp': datetime.now().isoformat()
                 })
+
+    # Add capacity and rising trend alerts even when model predictions are unavailable
+    if current_features:
+        current_count = current_features.get('current_count', current_features.get('people_count', 0))
+        growth_rate = current_features.get('growth_rate', 0.0)
+        density_trend = current_features.get('density_trend', 0)
+        avg_count = current_features.get('avg_count', current_count)
+        threshold = int(30 * 0.8)
+        existing_alert_types = {alert.get('type') for alert in alerts}
+
+        if current_count >= threshold and 'capacity_threshold' not in existing_alert_types:
+            alerts.append({
+                'type': 'capacity_threshold',
+                'message': f'Crowd reached {(current_count / 30) * 100:.1f}% of capacity ({current_count}/30). Take immediate action.',
+                'severity': 'critical',
+                'timestamp': datetime.now().isoformat()
+            })
+        elif (
+            growth_rate >= 0.5 and
+            density_trend == 1 and
+            current_count >= avg_count * 1.1 and
+            'rising_trend' not in existing_alert_types
+        ):
+            alerts.append({
+                'type': 'rising_trend',
+                'message': 'Crowd is gradually increasing. Please take necessary actions.',
+                'severity': 'warning',
+                'timestamp': datetime.now().isoformat()
+            })
     
     return jsonify({
         'alerts': alerts,

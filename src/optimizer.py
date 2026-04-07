@@ -357,6 +357,10 @@ class HeatmapGenerator:
     
     def apply_colormap(self, heatmap: np.ndarray, frame_shape: Tuple[int, int]) -> np.ndarray:
         """Apply colormap to heatmap and resize to frame dimensions"""
+        # Ensure heatmap is uint8 for colormap
+        if heatmap.dtype != np.uint8:
+            heatmap = np.clip(heatmap, 0, 255).astype(np.uint8)
+        
         # Apply colormap
         colored_heatmap = cv2.applyColorMap(heatmap, cv2.COLORMAP_JET)
         
@@ -369,9 +373,21 @@ class HeatmapGenerator:
 class AlertSystem:
     """Intelligent alert system for high-risk situations"""
     
-    def __init__(self, risk_threshold: float = 0.7, anomaly_threshold: float = 0.6):
+    def __init__(
+        self,
+        risk_threshold: float = 0.7,
+        anomaly_threshold: float = 0.6,
+        capacity_limit: int = 30,
+        alert_ratio: float = 0.8,
+        trend_window: int = 6,
+        trend_min_slope: float = 0.5
+    ):
         self.risk_threshold = risk_threshold
         self.anomaly_threshold = anomaly_threshold
+        self.capacity_limit = capacity_limit
+        self.alert_ratio = alert_ratio
+        self.trend_window = trend_window
+        self.trend_min_slope = trend_min_slope
         self.alert_history = deque(maxlen=50)
         self.active_alerts = {}
         self.alert_callbacks = []
@@ -421,6 +437,8 @@ class AlertSystem:
             count = features.get('current_count', 0)
             growth_rate = features.get('growth_rate', 0)
             volatility = features.get('volatility', 0)
+            avg_count = features.get('avg_count', 0)
+            density_trend = features.get('density_trend', 0)
             
             # Sudden crowd surge
             if growth_rate > 5.0:
@@ -430,6 +448,50 @@ class AlertSystem:
                     'message': f'Sudden crowd surge detected (growth rate: {growth_rate:.2f})',
                     'timestamp': current_time,
                     'data': {'growth_rate': growth_rate, 'count': count}
+                }
+                alerts.append(alert)
+            
+            # Capacity-based alert (Mall dataset requirement)
+            capacity_threshold = self.capacity_limit * self.alert_ratio
+            if count >= capacity_threshold:
+                utilization = (count / self.capacity_limit) * 100 if self.capacity_limit > 0 else 0
+                alert = {
+                    'type': 'capacity_threshold',
+                    'severity': 'critical',
+                    'message': (
+                        f'Crowd reached {utilization:.1f}% of capacity '
+                        f'({count}/{self.capacity_limit}). Take immediate action.'
+                    ),
+                    'timestamp': current_time,
+                    'data': {
+                        'count': count,
+                        'capacity_limit': self.capacity_limit,
+                        'capacity_utilization_percent': utilization
+                    }
+                }
+                alerts.append(alert)
+
+            # Gradually rising crowd warning
+            if (
+                growth_rate >= self.trend_min_slope and
+                density_trend == 1 and
+                avg_count > 0 and
+                count >= avg_count * 1.1
+            ):
+                alert = {
+                    'type': 'rising_trend',
+                    'severity': 'warning',
+                    'message': (
+                        'Crowd is gradually increasing. '
+                        'Please take necessary actions.'
+                    ),
+                    'timestamp': current_time,
+                    'data': {
+                        'count': count,
+                        'avg_count': avg_count,
+                        'growth_rate': growth_rate,
+                        'density_trend': density_trend
+                    }
                 }
                 alerts.append(alert)
             
