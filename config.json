@@ -1,0 +1,38 @@
+{
+  "detection": {
+    "model_path": "yolov8n.pt",
+    "confidence_threshold": 0.5,
+    "max_detections": 100
+  },
+  "analysis": {
+    "frame_shape": [480, 640],
+    "history_length": 30,
+    "grid_size": 20
+  },
+  "prediction": {
+    "model_type": "random_forest",
+    "ensemble": false
+  },
+  "anomaly_detection": {
+    "method": "isolation_forest",
+    "contamination": 0.1,
+    "multi_method": false
+  },
+  "optimization": {
+    "enable_realtime": true,
+    "max_workers": 4,
+    "buffer_size": 30,
+    "target_fps": 30.0
+  },
+  "alerts": {
+    "risk_threshold": 0.7,
+    "anomaly_threshold": 0.6,
+    "enable_callbacks": true
+  },
+  "output": {
+    "save_video": false,
+    "save_features": true,
+    "save_models": true,
+    "output_dir": "output"
+  }
+}

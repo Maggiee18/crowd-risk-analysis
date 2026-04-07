@@ -1,0 +1,11 @@
+{
+  "timestamp": "2026-04-07 11:16:34",
+  "people_count": 15,
+  "density_per_frame": 0.85,
+  "growth_rate": 2.3,
+  "volatility": 1.2,
+  "risk_level": "medium",
+  "confidence": 0.78,
+  "anomaly_detected": false,
+  "anomaly_score": 0.15
+}
