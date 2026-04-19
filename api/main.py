@@ -156,7 +156,7 @@ async def startup():
 
         # Try to train LSTM with synthetic data (runs quickly)
         try:
-            result = state.lstm_predictor.train(epochs=20, n_scenarios=20)
+            result = state.lstm_predictor.train(epochs=1, n_scenarios=2)
             logger.info(f"LSTM predictor trained: {result.get('status')}")
         except Exception as e:
             logger.warning(f"LSTM training skipped: {e}")
