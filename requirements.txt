@@ -11,3 +11,14 @@ pillow==10.0.0
 tqdm==4.66.1
 joblib==1.3.2
 scipy==1.11.2
+# FastAPI + WebSocket
+fastapi==0.104.1
+uvicorn[standard]==0.24.0
+websockets==12.0
+python-multipart==0.0.6
+# Deep SORT tracking
+deep-sort-realtime==1.3.2
+# PyTorch (CPU — use torch-cuda for GPU)
+torch>=2.0.0
+# RL / Utilities
+psutil==5.9.5

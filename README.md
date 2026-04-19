@@ -1,74 +1,162 @@
-# Crowd Risk Forecasting System
+# 🛡️ CrowdGuard — AI-Powered Crowd Risk Prediction & Intelligent Control System
 
-A comprehensive system for detecting and predicting crowd-related risks using computer vision and machine learning.
+A production-ready, real-time AI system for crowd detection, risk prediction, behavior analysis, and automated control suggestions.
 
-## Features
+## ⚡ Features
 
-- Real-time people detection using YOLOv8
-- Crowd density analysis
-- Spatio-temporal feature extraction
-- Machine learning-based risk prediction
-- Anomaly detection
-- Web-based dashboard with live video feed
-- Alert system for high-risk situations
+| Feature | Technology |
+|---------|-----------|
+| **People Detection** | YOLOv8 (Ultralytics) |
+| **Multi-Object Tracking** | Deep SORT / Centroid tracker |
+| **Crowd Density** | Spatial density mapping |
+| **Behavior Analysis** | Dense optical flow (Farneback) |
+| **Risk Prediction** | Random Forest / SVM / Ensemble |
+| **Anomaly Detection** | Isolation Forest / One-Class SVM |
+| **Future Prediction** | LSTM temporal model (PyTorch) |
+| **Control Suggestions** | Q-learning RL agent |
+| **Face Privacy** | Haar cascade face blurring |
+| **Live Dashboard** | React + Tailwind + Recharts |
+| **Real-time Streaming** | FastAPI + WebSocket |
+| **Simulation Mode** | 6 crowd scenarios |
+| **Admin Auth** | Token-based login |
+| **Incident Reports** | Automated HTML Snapshot Gen |
+| **Natural Language AI** | Pattern-matching NL query |
+| **Sentiment Estimation** | Multi-factor heuristic mapping |
+| **Audio Alert System** | Web Audio API synthetic tones |
+| **Geofence Zone Editor** | HTML Canvas interactive map |
 
-## Installation
-
-1. Clone the repository
-2. Install dependencies:
-   ```bash
-   pip install -r requirements.txt
-   ```
-
-## Project Structure
+## 📁 Project Structure
 
 ```
-crowd-risk-detection/
+crowdguard/
 ├── src/
-│   ├── __init__.py
-│   ├── detector.py          # YOLOv8 people detection
-│   ├── analyzer.py          # Crowd analysis and features
-│   ├── predictor.py         # ML models and prediction
-│   ├── anomaly_detector.py  # Anomaly detection
-│   └── utils.py            # Utility functions
-├── models/                  # Trained models
-├── data/                   # Sample videos and data
-├── api/                    # Flask API
-├── frontend/               # React frontend
-├── notebooks/              # Jupyter notebooks for analysis
-└── tests/                  # Unit tests
+│   ├── detector.py           # YOLOv8 people detection
+│   ├── analyzer.py           # Crowd analysis & optical flow
+│   ├── predictor.py          # ML risk prediction
+│   ├── anomaly_detector.py   # Anomaly detection
+│   ├── optimizer.py          # Real-time processing & alerts
+│   ├── tracker.py            # Deep SORT multi-object tracking
+│   ├── lstm_predictor.py     # LSTM temporal prediction
+│   ├── rl_controller.py      # RL crowd control agent
+│   ├── privacy.py            # Face blurring
+│   ├── simulator.py          # Mock crowd scenarios
+│   └── utils.py              # Utilities
+├── api/
+│   ├── main.py               # FastAPI + WebSocket server
+│   └── app.py                # Legacy Flask API
+├── frontend/
+│   ├── src/
+│   │   ├── App.jsx           # Main dashboard
+│   │   ├── components/       # 10+ UI components
+│   │   ├── hooks/            # WebSocket hook
+│   │   └── services/         # API service
+│   ├── tailwind.config.js
+│   └── package.json
+├── models/                   # Trained ML models
+├── data/                     # Sample data & videos
+├── config.json               # System configuration
+├── requirements.txt          # Python dependencies
+├── Dockerfile
+├── docker-compose.yml
+└── .env.example
 ```
 
-## Usage
+## 🚀 Quick Start
 
-### Basic Detection
-```python
-from src.detector import PeopleDetector
+### 1. Install Python Dependencies
 
-detector = PeopleDetector()
-detector.process_video("path/to/video.mp4")
-```
-
-### Risk Prediction
-```python
-from src.predictor import RiskPredictor
-
-predictor = RiskPredictor()
-risk_level = predictor.predict(features)
-```
-
-### Web Interface
 ```bash
-python api/app.py
+pip install -r requirements.txt
 ```
 
-Then open `http://localhost:5000` in your browser.
+### 2. Start Backend (FastAPI)
 
-## Phases
+```bash
+cd api
+uvicorn main:app --host 0.0.0.0 --port 8000 --reload
+```
 
-1. **Phase 1**: Video processing and people detection
-2. **Phase 2**: Crowd density and spatio-temporal analysis
-3. **Phase 3**: Machine learning model training
-4. **Phase 4**: Anomaly detection
-5. **Phase 5**: Web API and frontend
-6. **Phase 6**: Optimization and advanced features
+The API will be available at `http://localhost:8000`.
+- API docs: `http://localhost:8000/docs`
+- WebSocket: `ws://localhost:8000/ws`
+
+### 3. Start Frontend (React)
+
+```bash
+cd frontend
+npm install
+npm start
+```
+
+Dashboard available at `http://localhost:3000`.
+
+**Login:** `admin` / `admin123`
+
+### 4. Run Simulation
+
+You can start a simulation from the dashboard or via API:
+
+```bash
+curl -X POST http://localhost:8000/api/simulate -H "Content-Type: application/json" -d '{"scenario": "sudden_surge"}'
+```
+
+## 🐳 Docker
+
+```bash
+docker-compose up --build
+```
+
+## 🔌 API Endpoints
+
+| Method | Endpoint | Description |
+|--------|----------|-------------|
+| GET | `/api/status` | System health & components |
+| GET | `/api/current_state` | Latest analysis results |
+| POST | `/api/process_frame` | Process base64 frame |
+| GET | `/api/alerts` | Active alerts |
+| GET | `/api/history` | Historical data |
+| GET | `/api/predictions` | LSTM predictions |
+| GET | `/api/control_suggestions` | RL suggestions |
+| GET | `/api/zones` | Zone-based analysis |
+| GET | `/api/scenarios` | Available simulations |
+| POST | `/api/simulate` | Start simulation |
+| POST | `/api/simulate/stop` | Stop simulation |
+| POST | `/api/auth/login` | Admin login |
+| GET | `/api/privacy/toggle` | Toggle face blur |
+| GET | `/api/logs/download` | Download logs JSON |
+| WS | `/ws` | Real-time WebSocket |
+
+## 🧪 Sample Test Scenarios
+
+Available simulation scenarios:
+- `normal` — Steady low-to-moderate density
+- `gradual_buildup` — Slowly increasing crowd
+- `sudden_surge` — Abrupt crowd spike
+- `panic_event` — Normal → panic → return
+- `evacuation` — Large crowd dispersing
+- `concert` — Waves of density
+
+## 📊 Dashboard Features
+
+- **Live Video Feed** with bounding boxes
+- **Risk Explainability Panel** (shows exact factors driving risk scores)
+- **Sentiment Gauge** (estimates crowd mood from Calming to Panic)
+- **Real-time Charts** (people count, density, risk trends)
+- **LSTM Prediction & Comparative Analytics** (future crowd forecast & split views)
+- **Interactive Zone Editor** (draw bounding boxes for specific zone risk)
+- **Flow Direction Arrows** (visualize crowd movement physics)
+- **Alert Panel & Audio Sirens** (severity-coded notifications with procedural tone generation)
+- **Session Timeline** (visual history of anomaly/risk changes)
+- **NL Query Panel** (Ask "What is the peak crowd?" via built-in chatbot)
+- **Emergency Lockdown Broadcast** (instant data capture & alert sequence)
+- **Interactive What-If Simulator** (adjust sliders to test AI risk response)
+- **Privacy Toggle** (face blurring on/off)
+- **1-Click Incident Reports** (download HTML snapshots instantly)
+
+## ⚙️ Configuration
+
+Edit `config.json` or use environment variables (see `.env.example`).
+
+## 📄 License
+
+Open source — all libraries used are open-source.

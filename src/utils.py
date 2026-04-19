@@ -136,11 +136,11 @@ def create_heatmap(data: np.ndarray, title: str, save_path: str = None) -> None:
 
 def calculate_optical_flow(prev_frame: np.ndarray, curr_frame: np.ndarray) -> Tuple[np.ndarray, np.ndarray]:
     """
-    Calculate optical flow between consecutive frames
+    Calculate dense optical flow between consecutive frames using Farneback method.
     
     Args:
-        prev_frame: Previous frame
-        curr_frame: Current frame
+        prev_frame: Previous frame (BGR or grayscale)
+        curr_frame: Current frame (BGR or grayscale)
         
     Returns:
         Tuple of (flow_magnitude, flow_angle)
@@ -149,10 +149,15 @@ def calculate_optical_flow(prev_frame: np.ndarray, curr_frame: np.ndarray) -> Tu
     prev_gray = cv2.cvtColor(prev_frame, cv2.COLOR_BGR2GRAY) if len(prev_frame.shape) == 3 else prev_frame
     curr_gray = cv2.cvtColor(curr_frame, cv2.COLOR_BGR2GRAY) if len(curr_frame.shape) == 3 else curr_frame
     
-    # Calculate optical flow using Farneback method
-    flow = cv2.calcOpticalFlowPyrLK(prev_gray, curr_gray, None, None)
+    # Calculate dense optical flow using Farneback method
+    flow = cv2.calcOpticalFlowFarneback(
+        prev_gray, curr_gray, None,
+        pyr_scale=0.5, levels=3, winsize=15,
+        iterations=3, poly_n=5, poly_sigma=1.2,
+        flags=0
+    )
     
-    # Calculate magnitude and angle
+    # Calculate magnitude and angle from flow vectors
     magnitude, angle = cv2.cartToPolar(flow[..., 0], flow[..., 1])
     
     return magnitude, angle
@@ -223,3 +228,77 @@ def draw_text_with_background(frame: np.ndarray, text: str, position: Tuple[int,
     cv2.putText(frame, text, position, font, font_scale, color, thickness)
     
     return frame
+
+
+def blur_faces(frame: np.ndarray, scale_factor: float = 1.1,
+               min_neighbors: int = 5, blur_strength: int = 51) -> np.ndarray:
+    """
+    Detect and blur faces in a frame for privacy protection.
+    Uses OpenCV Haar cascade classifier.
+    
+    Args:
+        frame: Input BGR frame
+        scale_factor: Scale factor for face detection cascade
+        min_neighbors: Minimum neighbors for detection filtering
+        blur_strength: Gaussian blur kernel size (must be odd)
+        
+    Returns:
+        Frame with faces blurred
+    """
+    result = frame.copy()
+    gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+    
+    # Load Haar cascade for face detection
+    cascade_path = cv2.data.haarcascades + 'haarcascade_frontalface_default.xml'
+    face_cascade = cv2.CascadeClassifier(cascade_path)
+    
+    faces = face_cascade.detectMultiScale(
+        gray, scaleFactor=scale_factor,
+        minNeighbors=min_neighbors, minSize=(30, 30)
+    )
+    
+    # Ensure blur_strength is odd
+    if blur_strength % 2 == 0:
+        blur_strength += 1
+    
+    for (x, y, w, h) in faces:
+        # Extract face region and apply heavy Gaussian blur
+        face_roi = result[y:y+h, x:x+w]
+        blurred_face = cv2.GaussianBlur(face_roi, (blur_strength, blur_strength), 30)
+        result[y:y+h, x:x+w] = blurred_face
+    
+    return result
+
+
+def generate_zone_grid(frame_shape: Tuple[int, int], rows: int = 3, cols: int = 3) -> List[Dict]:
+    """
+    Divide frame into zones for zone-based analysis.
+    
+    Args:
+        frame_shape: (height, width) of the frame
+        rows: Number of rows in the grid
+        cols: Number of columns in the grid
+        
+    Returns:
+        List of zone dictionaries with coordinates and IDs
+    """
+    height, width = frame_shape
+    zone_h = height // rows
+    zone_w = width // cols
+    zones = []
+    
+    for r in range(rows):
+        for c in range(cols):
+            zone = {
+                'id': f'zone_{r}_{c}',
+                'label': f'Zone {r * cols + c + 1}',
+                'x1': c * zone_w,
+                'y1': r * zone_h,
+                'x2': (c + 1) * zone_w,
+                'y2': (r + 1) * zone_h,
+                'center': [(c * zone_w + (c + 1) * zone_w) // 2,
+                           (r * zone_h + (r + 1) * zone_h) // 2]
+            }
+            zones.append(zone)
+    
+    return zones

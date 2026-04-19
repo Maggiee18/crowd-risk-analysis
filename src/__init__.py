@@ -1,8 +1,37 @@
 """
-Crowd Risk Detection System
-A comprehensive system for detecting and predicting crowd-related risks
-using computer vision and machine learning.
+Crowd Risk Detection System — Source Package
 """
 
-__version__ = "1.0.0"
-__author__ = "Crowd Risk Detection Team"
+from .detector import PeopleDetector
+from .analyzer import CrowdAnalyzer
+from .predictor import RiskPredictor, EnsemblePredictor
+from .anomaly_detector import AnomalyDetector, MultiMethodAnomalyDetector
+from .optimizer import (
+    RealTimeProcessor, HeatmapGenerator, AlertSystem,
+    PerformanceMonitor, FrameBuffer
+)
+from .tracker import PersonTracker, CentroidTracker
+from .lstm_predictor import LSTMCrowdPredictor
+from .rl_controller import CrowdControlAgent
+from .privacy import PrivacyFilter
+from .simulator import CrowdSimulator
+
+__all__ = [
+    'PeopleDetector',
+    'CrowdAnalyzer',
+    'RiskPredictor',
+    'EnsemblePredictor',
+    'AnomalyDetector',
+    'MultiMethodAnomalyDetector',
+    'RealTimeProcessor',
+    'HeatmapGenerator',
+    'AlertSystem',
+    'PerformanceMonitor',
+    'FrameBuffer',
+    'PersonTracker',
+    'CentroidTracker',
+    'LSTMCrowdPredictor',
+    'CrowdControlAgent',
+    'PrivacyFilter',
+    'CrowdSimulator',
+]
