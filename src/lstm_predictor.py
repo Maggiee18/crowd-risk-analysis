@@ -183,6 +183,11 @@ class LSTMCrowdPredictor:
         # observed count instead of the absolute count. On noisy real data
         # this beats predicting raw counts.
         self.residual = False
+        # Optional extra ensemble members (averaged with self.model) and a
+        # blend with "count stays the same": pred = w*lstm + (1-w)*last_count.
+        # Both are set by training/train_models.py from validation data.
+        self.extra_models = []
+        self.blend_weight = 1.0
 
         # Normalisation stats
         self._mean = None
@@ -358,13 +363,20 @@ class LSTMCrowdPredictor:
             x_tensor = torch.FloatTensor(x_norm).unsqueeze(0).to(self.device)
 
             with torch.no_grad():
-                pred_norm = self.model(x_tensor).cpu().numpy()[0]
+                members = [self.model] + list(self.extra_models)
+                for m in members:
+                    m.eval()
+                pred_norm = np.mean([m(x_tensor).cpu().numpy()[0] for m in members], axis=0)
 
             # De-normalise
             if self.residual:
                 predictions = (pred_norm * self._std[0] + input_sequence[-1, 0]).tolist()
             else:
                 predictions = (pred_norm * self._std[0] + self._mean[0]).tolist()
+            w = float(self.blend_weight)
+            if w < 1.0:
+                last = float(input_sequence[-1, 0])
+                predictions = [w * p + (1 - w) * last for p in predictions]
             predictions = [max(0, p) for p in predictions]
 
             return {
@@ -400,7 +412,9 @@ class LSTMCrowdPredictor:
             'num_layers': self.num_layers,
             'mean': self._mean.tolist() if self._mean is not None else None,
             'std': self._std.tolist() if self._std is not None else None,
-            'residual': self.residual
+            'residual': self.residual,
+            'n_members': 1 + len(self.extra_models),
+            'blend_weight': self.blend_weight
         }
         with open(os.path.join(directory, 'lstm_meta.json'), 'w') as f:
             json.dump(meta, f, indent=2)
@@ -408,6 +422,8 @@ class LSTMCrowdPredictor:
         if TORCH_AVAILABLE and self.model is not None:
             torch.save(self.model.state_dict(),
                        os.path.join(directory, 'lstm_weights.pt'))
+            for i, m in enumerate(self.extra_models, start=1):
+                torch.save(m.state_dict(), os.path.join(directory, f'lstm_weights_{i}.pt'))
         logger.info(f"LSTM predictor saved to {directory}")
 
     def load(self, directory: str):
@@ -426,6 +442,8 @@ class LSTMCrowdPredictor:
         self.hidden_size = meta['hidden_size']
         self.num_layers = meta['num_layers']
         self.residual = meta.get('residual', False)
+        self.blend_weight = meta.get('blend_weight', 1.0)
+        n_members = meta.get('n_members', 1)
 
         if meta['mean'] is not None:
             self._mean = np.array(meta['mean'], dtype=np.float32)
@@ -445,6 +463,15 @@ class LSTMCrowdPredictor:
                     torch.load(weights_path, map_location=self.device)
                 )
                 self.model.eval()
+
+            self.extra_models = []
+            for i in range(1, n_members):
+                m = CrowdLSTM(input_size=self.input_features, hidden_size=self.hidden_size,
+                              num_layers=self.num_layers, output_steps=self.prediction_steps).to(self.device)
+                m.load_state_dict(torch.load(os.path.join(directory, f'lstm_weights_{i}.pt'),
+                                             map_location=self.device))
+                m.eval()
+                self.extra_models.append(m)
 
         self.is_trained = True
         logger.info(f"LSTM predictor loaded from {directory}")

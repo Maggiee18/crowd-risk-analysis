@@ -6,9 +6,14 @@ Handles video processing, people detection, and counting
 import cv2
 import numpy as np
 from ultralytics import YOLO
+import os
 import time
 from typing import List, Tuple, Dict
 import logging
+
+from count_corrector import frame_embedding, load_perspective
+
+DEFAULT_PERSPECTIVE = os.path.join(os.path.dirname(__file__), "..", "data", "perspective_roi.mat")
 
 class PeopleDetector:
     """
@@ -37,6 +42,7 @@ class PeopleDetector:
         # returned boxes are still the ones above confidence_threshold.
         self.count_corrector = None
         self.last_raw_count = 0
+        self._perspective = None  # loaded lazily, only the v2 corrector needs it
         self.person_class_id = 0  # COCO dataset class ID for 'person'
         self.frame_count = 0
         self.detection_history = []
@@ -98,7 +104,13 @@ class PeopleDetector:
         self.last_raw_count = people_count
         if use_corrector:
             h, w = frame.shape[:2]
-            people_count = self.count_corrector.predict(np.array(all_boxes).reshape(-1, 5), h, w)
+            emb = None
+            if self.count_corrector.needs_embedding:
+                if self._perspective is None:
+                    self._perspective = load_perspective(DEFAULT_PERSPECTIVE)
+                emb = frame_embedding(self.model, frame, self._perspective)
+            people_count = self.count_corrector.predict(
+                np.array(all_boxes).reshape(-1, 5), h, w, embedding=emb)
         
         return detections, people_count
     

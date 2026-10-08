@@ -105,7 +105,7 @@ curl -X POST http://localhost:8000/api/simulate -H "Content-Type: application/js
 All models are trained on the 2000 Mall frames with `data/mall_gt.mat` as ground truth. The first 80% of frames are used for training and the last 20% for testing (a random split would leak near identical neighbouring frames into the test set).
 
 ```bash
-python training/extract_detections.py   # YOLO pass over all frames, cached (~15 min on CPU)
+python training/extract_detections.py   # YOLO boxes + image features for all frames, cached (~20 min on CPU)
 python training/train_models.py         # trains + evaluates all models, saves to models/
 ```
 
@@ -113,10 +113,12 @@ The API and `main.py` load whatever is in `models/` automatically on startup.
 
 | Model | File | Test result (last 400 frames) |
 |---|---|---|
-| Count corrector (Ridge on YOLO box features) | `count_corrector.joblib` | Count error 4.33 → **2.42** people per frame; alert level matches ground truth 57% → **80%** |
-| Risk predictor (Random Forest) | `risk_predictor.pkl` | 79% accuracy, macro F1 0.786 (capacity rule on corrected count: 80%) |
+| Count corrector v2 (YOLO boxes + YOLO backbone image features, ridge, light smoothing) | `count_corrector.npz` | Count error 4.34 (raw YOLO) → 2.42 (boxes only) → **1.71** people per frame; alert level matches ground truth 57% → **83%** |
+| Risk predictor (Random Forest) | `risk_predictor.pkl` | **86%** accuracy, macro F1 0.867 |
 | Anomaly detector (Isolation Forest) | `anomaly_detector.pkl` | Flags 1.5% of test frames; scores calibrated so 1.0 = most unusual training frame |
-| LSTM forecaster (next 10 frames) | `lstm/` | Error 3.73 people vs 3.95 for "count stays the same" |
+| LSTM forecaster (3 model ensemble, next 10 frames) | `lstm/` | Error **3.44** people vs 3.52 for "count stays the same" |
+
+All settings (PCA size, ridge strength, smoothing, LSTM blend) are chosen on a validation slice (frames 1281 to 1600), never on the test frames.
 
 Notes:
 - Risk labels come from the ground truth count (low < 24, medium 24 to 30, high > 30), so the Random Forest cannot do much better than the count itself. To learn real risk, it needs labelled incidents.

@@ -5,7 +5,9 @@ scikit-learn pickles are not portable across versions: a Random Forest
 saved with 1.3 loads in 1.9 but returns nonsense probabilities (e.g. 63.5
 instead of 0..1). So models/ also ships the (small) training data, and if
 the installed scikit-learn/numpy differ from the ones the pickles were made
-with, the models are refit in memory at startup. That takes ~2 seconds.
+with, the risk and anomaly models are refit in memory at startup (~1 s).
+
+The count corrector is stored as plain numpy arrays and never needs a refit.
 
 Used by training/train_models.py (fitting) and by the API / main.py (loading).
 """
@@ -16,8 +18,7 @@ from typing import Dict
 
 import numpy as np
 import sklearn
-from sklearn.ensemble import HistGradientBoostingRegressor, IsolationForest, RandomForestClassifier
-from sklearn.linear_model import Ridge
+from sklearn.ensemble import IsolationForest, RandomForestClassifier
 from sklearn.preprocessing import LabelEncoder, StandardScaler
 
 from anomaly_detector import AnomalyDetector
@@ -29,23 +30,12 @@ logger = logging.getLogger(__name__)
 DATA_FILE = "mall_training_data.npz"
 VERSIONS_FILE = "versions.json"
 
-COUNT_MODELS = {
-    "ridge": lambda: Ridge(alpha=1.0),
-    "gradient_boosting": lambda: HistGradientBoostingRegressor(
-        max_iter=300, learning_rate=0.05, max_leaf_nodes=15, random_state=42),
-}
-
-
 def current_versions() -> Dict[str, str]:
     return {"sklearn": sklearn.__version__, "numpy": np.__version__}
 
 
 def _major_minor(v: str) -> str:
     return ".".join(v.split(".")[:2])
-
-
-def fit_count_corrector(X_box, gt, model_name="ridge") -> CountCorrector:
-    return CountCorrector(COUNT_MODELS[model_name]().fit(X_box, gt))
 
 
 def fit_risk_predictor(feats, labels, feature_names) -> RiskPredictor:
@@ -71,12 +61,11 @@ def fit_anomaly_detector(feats, feature_names) -> AnomalyDetector:
     return ad
 
 
-def save_training_data(models_dir, X_box, gt, feats, labels, feature_names, split, count_model):
+def save_training_data(models_dir, gt, feats, labels, feature_names, split):
     np.savez_compressed(
         os.path.join(models_dir, DATA_FILE),
-        X_box=X_box.astype(np.float32), gt=gt.astype(np.float32), feats=feats.astype(np.float32),
-        labels=np.array(labels), feature_names=np.array(feature_names),
-        split=split, count_model=count_model)
+        gt=gt.astype(np.float32), feats=feats.astype(np.float32),
+        labels=np.array(labels), feature_names=np.array(feature_names), split=split)
     with open(os.path.join(models_dir, VERSIONS_FILE), "w") as f:
         json.dump(current_versions(), f, indent=2)
 
@@ -86,7 +75,6 @@ def _refit_all(models_dir) -> Dict:
     s = int(d["split"])
     names = [str(n) for n in d["feature_names"]]
     return {
-        "count_corrector": fit_count_corrector(d["X_box"][:s], d["gt"][:s], str(d["count_model"])),
         "risk_predictor": fit_risk_predictor(d["feats"][:s], d["labels"][:s], names),
         "anomaly_detector": fit_anomaly_detector(d["feats"][:s], names),
     }
@@ -107,11 +95,18 @@ def load_mall_models(models_dir: str) -> Dict:
     now = current_versions()
     same = saved and all(_major_minor(saved.get(k, "")) == _major_minor(v) for k, v in now.items())
 
+    # Count corrector: numpy arrays (v2) or an older joblib (v1)
+    for fname in ("count_corrector.npz", "count_corrector.joblib"):
+        path = os.path.join(models_dir, fname)
+        if os.path.exists(path):
+            try:
+                out["count_corrector"] = CountCorrector.load(path)
+                break
+            except Exception as e:
+                logger.warning(f"Could not load {fname}: {e}")
+
     if same:
         try:
-            cc = CountCorrector.load(os.path.join(models_dir, "count_corrector.joblib"))
-            if cc is not None:
-                out["count_corrector"] = cc
             for key, obj, fname in [("risk_predictor", RiskPredictor(), "risk_predictor.pkl"),
                                     ("anomaly_detector", AnomalyDetector(), "anomaly_detector.pkl")]:
                 path = os.path.join(models_dir, fname)
@@ -125,5 +120,5 @@ def load_mall_models(models_dir: str) -> Dict:
     if os.path.exists(os.path.join(models_dir, DATA_FILE)):
         logger.warning(f"Models were saved with {saved or 'unknown versions'}, running {now}: "
                        "refitting from models/mall_training_data.npz")
-        return _refit_all(models_dir)
+        out.update(_refit_all(models_dir))
     return out

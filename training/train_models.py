@@ -4,7 +4,7 @@ Step 2: train all CrowdGuard models on the Mall dataset.
 Needs training/cache/detections.npz from extract_detections.py.
 
 Trains, evaluates on a held-out time split, and saves to models/:
-  1. count_corrector.joblib   raw YOLO boxes -> calibrated people count
+  1. count_corrector.npz      YOLO boxes + backbone image features -> people count
   2. risk_predictor.pkl       Random Forest, low / medium / high risk
   3. anomaly_detector.pkl     Isolation Forest on normal crowd features
   4. lstm/                    LSTM forecasting the next 10 frames' count
@@ -25,7 +25,9 @@ import numpy as np
 import pandas as pd
 import scipy.io as sio
 from sklearn.metrics import accuracy_score, confusion_matrix, f1_score, mean_absolute_error
-from sklearn.model_selection import KFold, cross_val_predict
+from sklearn.decomposition import PCA
+from sklearn.linear_model import Ridge
+from sklearn.preprocessing import StandardScaler
 
 ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
 sys.path.insert(0, os.path.join(ROOT, "src"))
@@ -34,13 +36,17 @@ import logging  # noqa: E402
 logging.disable(logging.INFO)
 
 from analyzer import CrowdAnalyzer  # noqa: E402
-from count_corrector import FEATURE_NAMES as BOX_FEATURES, box_features  # noqa: E402
+from count_corrector import CountCorrector, FEATURE_NAMES as BOX_FEATURES, box_features  # noqa: E402
 from lstm_predictor import LSTMCrowdPredictor, TORCH_AVAILABLE  # noqa: E402
-from mall_models import (COUNT_MODELS, fit_anomaly_detector, fit_count_corrector,  # noqa: E402
-                         fit_risk_predictor, save_training_data)
+from mall_models import fit_anomaly_detector, fit_risk_predictor, save_training_data  # noqa: E402
 
 MODELS = os.path.join(ROOT, "models")
 CACHE = os.path.join(os.path.dirname(__file__), "cache", "detections.npz")
+EMB_CACHE = os.path.join(os.path.dirname(__file__), "cache", "embeddings.npz")
+PCA_SIZES = (32, 64, 96, 128)
+RIDGE_ALPHAS = (0.1, 1.0, 10.0)
+EMA_ALPHAS = (1.0, 0.7, 0.5)
+LSTM_SEEDS = (1, 2, 3)
 CAPACITY, ALERT_RATIO, DISPLAY_CONF = 30, 0.8, 0.15
 TRAIN_FRAC = 0.8
 
@@ -60,6 +66,28 @@ def risk_label(count):
     if count >= CAPACITY * ALERT_RATIO:
         return "medium"
     return "low"
+
+
+def ema(p, a):
+    """Causal exponential smoothing (a=1 means no smoothing)."""
+    p = np.asarray(p, dtype=float)
+    if a >= 1:
+        return p.copy()
+    out = p.copy()
+    for i in range(1, len(p)):
+        out[i] = a * p[i] + (1 - a) * out[i - 1]
+    return out
+
+
+def fit_corrector_params(Xb, E, y, k, alpha, ema_alpha):
+    """PCA on image embeddings + standardise + ridge, returned as numpy arrays."""
+    pca = PCA(k, random_state=0).fit(E)
+    Z = np.hstack([Xb, pca.transform(E)])
+    sc = StandardScaler().fit(Z)
+    rg = Ridge(alpha=alpha).fit(sc.transform(Z), y)
+    return {"pca_mean": pca.mean_, "pca_components": pca.components_,
+            "x_mean": sc.mean_, "x_scale": sc.scale_, "coef": rg.coef_,
+            "intercept": np.array(rg.intercept_), "ema_alpha": np.array(ema_alpha)}
 
 
 def _np(o):
@@ -91,29 +119,45 @@ def main():
     print(f"{n} frames: train 1..{split}, test {split + 1}..{n}")
 
     # ------------------------------------------------------------------
-    section("1. Count corrector")
+    section("1. Count corrector (box + image features)")
     X = np.stack([box_features(b) for b in per_frame])
+    emb = np.load(EMB_CACHE)["emb"].astype(np.float64)
     raw = X[:, BOX_FEATURES.index("n_conf_0.15")]
-    # choose the model on the last 20% of the training part, report on test
-    val = slice(int(split * 0.8), split)
-    fit = slice(0, int(split * 0.8))
-    candidates = COUNT_MODELS
-    val_mae = {}
-    for name, make in candidates.items():
-        m = make().fit(X[fit], gt[fit])
-        val_mae[name] = mean_absolute_error(gt[val], m.predict(X[val]))
-    best = min(val_mae, key=val_mae.get)
-    cc = fit_count_corrector(X[tr], gt[tr], best)
-    corrected_test = np.clip(np.round(cc.model.predict(X[te])), 0, None)
-    # out-of-fold predictions for training frames, so the downstream models
-    # see realistic (not memorised) counts
-    oof = cross_val_predict(candidates[best](), X[tr], gt[tr], cv=KFold(5, shuffle=False))
-    corrected = np.concatenate([np.clip(np.round(oof), 0, None), corrected_test])
+    # choose settings on the last 20% of the training part, report on test
+    v = int(split * 0.8)
+    v1 = Ridge(alpha=1.0).fit(X[:v], gt[:v])
+    v1_val = mean_absolute_error(gt[v:split], np.round(v1.predict(X[v:split])))
+    grid = []
+    for k in PCA_SIZES:
+        for alpha in RIDGE_ALPHAS:
+            p_ = fit_corrector_params(X[:v], emb[:v], gt[:v], k, alpha, 1.0)
+            raw_pred = CountCorrector(params=p_).raw_predict(X, emb)
+            for e in EMA_ALPHAS:
+                grid.append((mean_absolute_error(gt[v:split], np.round(ema(raw_pred, e)[v:split])), k, alpha, e))
+    grid.sort()
+    val_mae, k, alpha, e = grid[0]
+    print(f"validation: box-only ridge {v1_val:.2f}, best v2 {val_mae:.2f} (pca={k}, alpha={alpha}, ema={e})")
 
+    params = fit_corrector_params(X[tr], emb[tr], gt[tr], k, alpha, e)
+    cc = CountCorrector(params=params)
+    corrected_test = np.clip(np.round(ema(cc.raw_predict(X, emb), e)[te]), 0, None)
+    # out-of-fold predictions for training frames (5 contiguous folds), so
+    # the downstream models see realistic (not memorised) counts
+    oof = np.zeros(split)
+    for fold in np.array_split(np.arange(split), 5):
+        mask = np.ones(split, bool)
+        mask[fold] = False
+        pf = fit_corrector_params(X[:split][mask], emb[:split][mask], gt[:split][mask], k, alpha, e)
+        oof[fold] = CountCorrector(params=pf).raw_predict(X[fold], emb[fold])
+    corrected = np.concatenate([np.clip(np.round(ema(oof, e)), 0, None), corrected_test])
+
+    v1_full = Ridge(alpha=1.0).fit(X[tr], gt[tr])
     r = {
-        "model": best,
-        "validation_mae": {k: round(v, 2) for k, v in val_mae.items()},
+        "model": "v2: ridge on box features + PCA of YOLO backbone features, EMA smoothed",
+        "settings": {"pca_components": int(k), "ridge_alpha": alpha, "ema_alpha": e},
+        "validation_mae": {"box_only_v1": round(v1_val, 2), "v2": round(val_mae, 2)},
         "test_mae_raw_yolo": round(mean_absolute_error(gt[te], raw[te]), 2),
+        "test_mae_box_only_v1": round(mean_absolute_error(gt[te], np.round(v1_full.predict(X[te]))), 2),
         "test_mae_corrected": round(mean_absolute_error(gt[te], corrected_test), 2),
         "test_mean_gt": round(gt[te].mean(), 1),
         "test_mean_raw": round(raw[te].mean(), 1),
@@ -124,7 +168,10 @@ def main():
     r["test_alert_level_match_corrected"] = round(float(np.mean(lvl(corrected_test) == lvl(gt[te]))), 3)
     print(dump(r))
     report["count_corrector"] = r
-    cc.save(os.path.join(MODELS, "count_corrector.joblib"))
+    cc.save(os.path.join(MODELS, "count_corrector.npz"))
+    old = os.path.join(MODELS, "count_corrector.joblib")
+    if os.path.exists(old):
+        os.remove(old)
 
     # ------------------------------------------------------------------
     section("Replaying frames through the analyzer (optical flow etc.)")
@@ -186,7 +233,7 @@ def main():
     report["anomaly_detector"] = r
     ad.save_model(os.path.join(MODELS, "anomaly_detector.pkl"))
     # Ship the training data so other scikit-learn versions can refit
-    save_training_data(MODELS, X, gt, feats.values, y_lab, RISK_FEATURES, split, best)
+    save_training_data(MODELS, gt, feats.values, y_lab, RISK_FEATURES, split)
 
     # ------------------------------------------------------------------
     section("4. LSTM forecaster (next 10 frames)")
@@ -201,23 +248,50 @@ def main():
     series = np.stack([corrected, feats.density_per_frame, feats.avg_magnitude,
                        feats.movement_concentration], axis=1).astype(np.float32)
     # Small network + few epochs: bigger ones overfit the 1600 training
-    # frames and lose to the "count stays the same" baseline.
+    # frames. Three seeds are averaged (single runs vary a lot), then blended
+    # with "count stays the same" using a weight chosen on validation.
     import torch
-    torch.manual_seed(1)
-    np.random.seed(1)
-    lstm = LSTMCrowdPredictor(window_size=30, prediction_steps=10, hidden_size=16)
-    res = lstm.train_on_sequence(series[tr], epochs=40, batch_size=32, lr=0.001)
-    # evaluate on test windows against the true (GT) future counts
-    Xt, _ = lstm.make_windows(series[split - 30:])  # include 30 frames of context
-    yt = np.array([gt[split - 30 + i + 30: split - 30 + i + 40] for i in range(len(Xt))])
+
+    def train_ensemble(end):
+        members = []
+        for sd in LSTM_SEEDS:
+            torch.manual_seed(sd)
+            np.random.seed(sd)
+            m = LSTMCrowdPredictor(window_size=30, prediction_steps=10, hidden_size=16)
+            res_ = m.train_on_sequence(series[:end], epochs=40, batch_size=32, lr=0.001)
+            members.append((m, res_))
+        main_m = members[0][0]
+        main_m.extra_models = [m.model for m, _ in members[1:]]
+        return main_m, members[0][1]
+
+    def windows(start, end):
+        Xw, _ = lstm.make_windows(series[start - 30:end])
+        yw = np.array([gt[start + i:start + i + 10] for i in range(len(Xw))])
+        return Xw, yw
+
+    v_l = int(split * 0.8)
+    lstm, _ = train_ensemble(v_l)
+    Xv, yv = windows(v_l + 30, split)
+    pv = np.array([lstm.predict(x)["predictions"] for x in Xv])
+    pers_v = np.repeat(Xv[:, -1, 0:1], 10, axis=1)
+    weights = np.round(np.linspace(0, 1, 11), 1)
+    blend = float(weights[np.argmin([np.abs(w * pv + (1 - w) * pers_v - yv).mean() for w in weights])])
+
+    lstm, res = train_ensemble(split)
+    Xt, yt = windows(split, n)
+    lstm.blend_weight = 1.0
+    pure = np.array([lstm.predict(x)["predictions"] for x in Xt])
+    lstm.blend_weight = blend
     preds = np.array([lstm.predict(x)["predictions"] for x in Xt])
     persist = np.repeat(Xt[:, -1, 0:1], 10, axis=1)          # "count stays the same"
     window_mean = np.repeat(Xt[:, :, 0].mean(1, keepdims=True), 10, axis=1)
     r = {
         "train_status": res.get("status"),
-        "best_val_loss": round(float(res.get("best_val_loss", 0)), 4),
+        "members": len(LSTM_SEEDS),
+        "blend_weight_chosen_on_validation": blend,
         "test_windows": int(len(Xt)),
         "test_mae_lstm": round(float(np.abs(preds - yt).mean()), 2),
+        "test_mae_lstm_ensemble_unblended": round(float(np.abs(pure - yt).mean()), 2),
         "test_mae_persistence_baseline": round(float(np.abs(persist - yt).mean()), 2),
         "test_mae_window_mean_baseline": round(float(np.abs(window_mean - yt).mean()), 2),
         "test_mae_by_horizon_lstm": [round(float(v), 2) for v in np.abs(preds - yt).mean(0)],
