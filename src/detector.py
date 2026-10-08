@@ -32,6 +32,11 @@ class PeopleDetector:
         self.model = YOLO(model_path)
         self.confidence_threshold = confidence_threshold
         self.imgsz = imgsz
+        # Optional trained CountCorrector (see src/count_corrector.py).
+        # When set, the returned count is the calibrated one, while the
+        # returned boxes are still the ones above confidence_threshold.
+        self.count_corrector = None
+        self.last_raw_count = 0
         self.person_class_id = 0  # COCO dataset class ID for 'person'
         self.frame_count = 0
         self.detection_history = []
@@ -53,9 +58,11 @@ class PeopleDetector:
             count: Number of people detected
         """
         # Run YOLOv8 inference
+        use_corrector = self.count_corrector is not None and self.count_corrector.is_trained
+        run_conf = min(self.confidence_threshold, 0.05) if use_corrector else self.confidence_threshold
         results = self.model(
             frame,
-            conf=self.confidence_threshold,
+            conf=run_conf,
             imgsz=self.imgsz,
             classes=[self.person_class_id],
             verbose=False,
@@ -63,6 +70,7 @@ class PeopleDetector:
         
         detections = []
         people_count = 0
+        all_boxes = []
         
         for result in results:
             boxes = result.boxes
@@ -73,6 +81,9 @@ class PeopleDetector:
                         # Get bounding box coordinates
                         x1, y1, x2, y2 = box.xyxy[0].cpu().numpy()
                         confidence = float(box.conf[0].cpu().numpy())
+                        all_boxes.append([x1, y1, x2, y2, confidence])
+                        if confidence < self.confidence_threshold:
+                            continue
                         
                         detection = {
                             'bbox': [int(x1), int(y1), int(x2), int(y2)],
@@ -83,6 +94,11 @@ class PeopleDetector:
                         
                         detections.append(detection)
                         people_count += 1
+        
+        self.last_raw_count = people_count
+        if use_corrector:
+            h, w = frame.shape[:2]
+            people_count = self.count_corrector.predict(np.array(all_boxes).reshape(-1, 5), h, w)
         
         return detections, people_count
     

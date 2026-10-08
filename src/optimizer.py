@@ -184,12 +184,12 @@ class RealTimeProcessor:
         detections, count = self.detector.detect_people(frame)
         
         # Analyze crowd
-        features = self.analyzer.update_frame(frame, detections)
+        features = self.analyzer.update_frame(frame, detections, people_count=count)
         
         # Risk prediction
         risk_result = {}
         if self.predictor and self.predictor.is_trained:
-            feature_vector = self.analyzer.get_feature_vector()
+            feature_vector = self.analyzer.get_feature_vector(self.predictor.feature_names)
             if len(feature_vector) > 0:
                 risk_level, confidence = self.predictor.predict(feature_vector)
                 risk_result = {
@@ -200,7 +200,7 @@ class RealTimeProcessor:
         # Anomaly detection
         anomaly_result = {}
         if self.anomaly_detector and self.anomaly_detector.is_trained:
-            feature_vector = self.analyzer.get_feature_vector()
+            feature_vector = self.analyzer.get_feature_vector(self.anomaly_detector.feature_names)
             if len(feature_vector) > 0:
                 is_anomaly, anomaly_score, anomaly_details = self.anomaly_detector.detect_anomaly(feature_vector)
                 anomaly_result = {

@@ -100,6 +100,30 @@ You can start a simulation from the dashboard or via API:
 curl -X POST http://localhost:8000/api/simulate -H "Content-Type: application/json" -d '{"scenario": "sudden_surge"}'
 ```
 
+## 🧠 Training on the Mall Dataset
+
+All models are trained on the 2000 Mall frames with `data/mall_gt.mat` as ground truth. The first 80% of frames are used for training and the last 20% for testing (a random split would leak near identical neighbouring frames into the test set).
+
+```bash
+python training/extract_detections.py   # YOLO pass over all frames, cached (~15 min on CPU)
+python training/train_models.py         # trains + evaluates all models, saves to models/
+```
+
+The API and `main.py` load whatever is in `models/` automatically on startup.
+
+| Model | File | Test result (last 400 frames) |
+|---|---|---|
+| Count corrector (Ridge on YOLO box features) | `count_corrector.joblib` | Count error 4.33 → **2.42** people per frame; alert level matches ground truth 57% → **80%** |
+| Risk predictor (Random Forest) | `risk_predictor.pkl` | 79% accuracy, macro F1 0.786 (capacity rule on corrected count: 80%) |
+| Anomaly detector (Isolation Forest) | `anomaly_detector.pkl` | Flags 1.5% of test frames; scores calibrated so 1.0 = most unusual training frame |
+| LSTM forecaster (next 10 frames) | `lstm/` | Error 3.73 people vs 3.95 for "count stays the same" |
+
+Notes:
+- Risk labels come from the ground truth count (low < 24, medium 24 to 30, high > 30), so the Random Forest cannot do much better than the count itself. To learn real risk, it needs labelled incidents.
+- The Mall video has no real incidents, so the anomaly detector mostly confirms normal behaviour.
+- The scikit-learn pickles were saved with scikit-learn 1.3 / numpy 1.24 (the pinned versions). With any other version they are refit automatically at startup from `models/mall_training_data.npz` (about 1 second), because pickles across versions give wrong probabilities.
+- Full metrics are in `models/training_report.json`.
+
 ## 🐳 Docker
 
 ```bash
