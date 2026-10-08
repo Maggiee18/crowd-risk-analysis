@@ -188,9 +188,15 @@ class RiskPredictor:
         # Encode labels
         y = self.label_encoder.fit_transform(labels)
         
-        # Split data
+        # Split data. Stratify only when every class has at least 2 samples,
+        # otherwise sklearn raises "least populated class has only 1 member".
+        class_counts = Counter(y)
+        can_stratify = len(class_counts) > 1 and min(class_counts.values()) >= 2
+        if not can_stratify:
+            self.logger.warning(f"Not stratifying split, class counts: {dict(class_counts)}")
         X_train, X_test, y_train, y_test = train_test_split(
-            X, y, test_size=test_size, random_state=42, stratify=y
+            X, y, test_size=test_size, random_state=42,
+            stratify=y if can_stratify else None
         )
         
         # Scale features
@@ -289,18 +295,23 @@ class RiskPredictor:
         
         # Calculate metrics
         accuracy = accuracy_score(y_test, y_pred)
-        precision = precision_score(y_test, y_pred, average='weighted')
-        recall = recall_score(y_test, y_pred, average='weighted')
-        f1 = f1_score(y_test, y_pred, average='weighted')
+        precision = precision_score(y_test, y_pred, average='weighted', zero_division=0)
+        recall = recall_score(y_test, y_pred, average='weighted', zero_division=0)
+        f1 = f1_score(y_test, y_pred, average='weighted', zero_division=0)
         
-        # Get class names
+        # Get class names. Pass explicit labels so the report still works when
+        # the test split happens to be missing one of the classes.
         class_names = self.label_encoder.classes_
+        all_labels = list(range(len(class_names)))
         
         # Classification report
-        report = classification_report(y_test, y_pred, target_names=class_names, output_dict=True)
+        report = classification_report(
+            y_test, y_pred, labels=all_labels, target_names=class_names,
+            output_dict=True, zero_division=0
+        )
         
         # Confusion matrix
-        cm = confusion_matrix(y_test, y_pred)
+        cm = confusion_matrix(y_test, y_pred, labels=all_labels)
         
         results = {
             'accuracy': accuracy,

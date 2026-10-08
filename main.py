@@ -63,7 +63,8 @@ class CrowdRiskSystem:
         default_config = {
             'detection': {
                 'model_path': 'yolov8n.pt',
-                'confidence_threshold': 0.5,
+                'confidence_threshold': 0.15,
+                'imgsz': 1280,
                 'max_detections': 100
             },
             'analysis': {
@@ -130,7 +131,8 @@ class CrowdRiskSystem:
             print("Initializing people detector...")
             self.detector = PeopleDetector(
                 model_path=self.config['detection']['model_path'],
-                confidence_threshold=self.config['detection']['confidence_threshold']
+                confidence_threshold=self.config['detection']['confidence_threshold'],
+                imgsz=self.config['detection'].get('imgsz', 1280)
             )
             
             # Initialize analyzer
@@ -216,23 +218,23 @@ class CrowdRiskSystem:
         """Load pre-trained models if available"""
         models_dir = os.path.join(os.path.dirname(__file__), 'models')
         
-        # Load risk prediction model
-        risk_model_path = os.path.join(models_dir, 'risk_predictor.pkl')
-        if os.path.exists(risk_model_path):
-            try:
-                self.risk_predictor.load_model(risk_model_path)
-                print("Loaded pre-trained risk prediction model")
-            except Exception as e:
-                print(f"Error loading risk model: {e}")
-        
-        # Load anomaly detection model
-        anomaly_model_path = os.path.join(models_dir, 'anomaly_detector.pkl')
-        if os.path.exists(anomaly_model_path):
-            try:
-                self.anomaly_detector.load_model(anomaly_model_path)
-                print("Loaded pre-trained anomaly detection model")
-            except Exception as e:
-                print(f"Error loading anomaly model: {e}")
+        # Mall-trained models (count corrector, risk, anomaly). Refit
+        # automatically if the installed scikit-learn version differs.
+        from mall_models import load_mall_models
+        try:
+            models = load_mall_models(models_dir)
+        except Exception as e:
+            print(f"Error loading trained models: {e}")
+            models = {}
+        if 'count_corrector' in models and self.detector is not None:
+            self.detector.count_corrector = models['count_corrector']
+            print("Loaded count corrector")
+        if 'risk_predictor' in models:
+            self.risk_predictor = models['risk_predictor']
+            print("Loaded pre-trained risk prediction model")
+        if 'anomaly_detector' in models:
+            self.anomaly_detector = models['anomaly_detector']
+            print("Loaded pre-trained anomaly detection model")
     
     def process_video(self, video_path: str, output_path: str = None) -> Dict:
         """
@@ -290,6 +292,9 @@ class CrowdRiskSystem:
                 # Process frame
                 result = self._process_frame(frame, frame_count, fps)
                 frame_results.append(result)
+                if self.performance_monitor:
+                    pt = result['processing_time']
+                    self.performance_monitor.update(pt, 1.0 / pt if pt > 0 else 0)
                 
                 # Draw annotations
                 annotated_frame = self._draw_annotations(frame, result)
@@ -407,7 +412,7 @@ class CrowdRiskSystem:
         detections, count = self.detector.detect_people(frame)
         
         # Analyze crowd
-        features = self.analyzer.update_frame(frame, detections)
+        features = self.analyzer.update_frame(frame, detections, people_count=count)
         
         # Generate heatmap
         heatmap = self.heatmap_generator.generate_heatmap(detections, frame.shape[:2])
@@ -415,7 +420,7 @@ class CrowdRiskSystem:
         # Risk prediction
         risk_result = {}
         if self.risk_predictor.is_trained:
-            feature_vector = self.analyzer.get_feature_vector()
+            feature_vector = self.analyzer.get_feature_vector(self.risk_predictor.feature_names)
             if len(feature_vector) > 0:
                 if self.ensemble_predictor:
                     risk_level, confidence, individual_predictions = self.ensemble_predictor.predict(feature_vector)
@@ -433,8 +438,8 @@ class CrowdRiskSystem:
         
         # Anomaly detection
         anomaly_result = {}
-        if self.anomaly_detector.is_trained:
-            feature_vector = self.analyzer.get_feature_vector()
+        if self.anomaly_detector.is_trained and len(self.analyzer.count_history) >= 10:
+            feature_vector = self.analyzer.get_feature_vector(self.anomaly_detector.feature_names)
             if len(feature_vector) > 0:
                 if hasattr(self.anomaly_detector, 'detect_ensemble'):
                     anomaly_result = self.anomaly_detector.detect_ensemble(feature_vector)
@@ -446,6 +451,18 @@ class CrowdRiskSystem:
                         'details': details
                     }
         
+        # Rule-based risk fallback when no model is trained (same rule as the
+        # API): medium at >= 80% of capacity, high once capacity is exceeded.
+        if not risk_result:
+            cap = self.config['alerts'].get('capacity_limit', 30)
+            ratio = self.config['alerts'].get('capacity_alert_ratio', 0.8)
+            if count > cap:
+                risk_result = {'risk_level': 'high', 'confidence': 0.9}
+            elif count >= cap * ratio:
+                risk_result = {'risk_level': 'medium', 'confidence': 0.7}
+            else:
+                risk_result = {'risk_level': 'low', 'confidence': 0.8}
+
         # Generate alerts
         alerts = []
         if self.alert_system:
@@ -691,6 +708,7 @@ def main():
     # Update output directory if specified
     if args.output:
         system.config['output']['output_dir'] = args.output
+        ensure_dir(args.output)
     
     # Train models if requested
     if args.train:

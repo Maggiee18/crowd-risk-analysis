@@ -37,17 +37,26 @@ class PrivacyFilter:
         self.min_face_size = min_face_size
         self.enabled = enabled
 
-        # Load cascades
-        cascade_path = cv2.data.haarcascades + 'haarcascade_frontalface_default.xml'
-        profile_path = cv2.data.haarcascades + 'haarcascade_profileface.xml'
-
-        self.face_cascade = cv2.CascadeClassifier(cascade_path)
-        self.profile_cascade = cv2.CascadeClassifier(profile_path)
-
-        if self.face_cascade.empty():
-            logger.error("Failed to load frontal face cascade")
-        if self.profile_cascade.empty():
-            logger.warning("Profile face cascade not available — using frontal only")
+        # Load cascades. OpenCV 5 moved Haar cascades out of the main
+        # module, so degrade gracefully instead of crashing startup.
+        self.face_cascade = None
+        self.profile_cascade = None
+        if hasattr(cv2, 'CascadeClassifier') and hasattr(cv2, 'data'):
+            cascade_path = cv2.data.haarcascades + 'haarcascade_frontalface_default.xml'
+            profile_path = cv2.data.haarcascades + 'haarcascade_profileface.xml'
+            self.face_cascade = cv2.CascadeClassifier(cascade_path)
+            self.profile_cascade = cv2.CascadeClassifier(profile_path)
+            if self.face_cascade.empty():
+                logger.error("Failed to load frontal face cascade")
+                self.face_cascade = None
+            if self.profile_cascade.empty():
+                logger.warning("Profile face cascade not available — using frontal only")
+                self.profile_cascade = None
+        else:
+            logger.warning(
+                "cv2.CascadeClassifier not available (OpenCV 5?). "
+                "Face blurring disabled; install opencv-python<5 to enable it."
+            )
 
         self._face_count = 0
         self._frames_processed = 0
@@ -59,6 +68,9 @@ class PrivacyFilter:
         Returns:
             List of (x, y, w, h) tuples for each detected face.
         """
+        if self.face_cascade is None:
+            return []
+
         gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
         gray = cv2.equalizeHist(gray)
 
@@ -71,7 +83,7 @@ class PrivacyFilter:
 
         # Also try profile faces
         profiles = []
-        if not self.profile_cascade.empty():
+        if self.profile_cascade is not None:
             profiles = self.profile_cascade.detectMultiScale(
                 gray,
                 scaleFactor=self.scale_factor,

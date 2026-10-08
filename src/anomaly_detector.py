@@ -149,8 +149,12 @@ class AnomalyDetector:
         else:
             anomaly_score = 0.0
         
-        # Normalize score to [0, 1] where higher means more anomalous
-        if self.method == 'isolation_forest':
+        # Normalize score to [0, 1] where higher means more anomalous.
+        # score_scale (set by training) maps the most anomalous training
+        # sample to 1.0, so thresholds like 0.6 are actually reachable.
+        if getattr(self, 'score_scale', None):
+            normalized_score = float(np.clip(-anomaly_score / self.score_scale, 0, 1))
+        elif self.method == 'isolation_forest':
             # Isolation Forest: lower scores are more anomalous
             normalized_score = max(0, -anomaly_score)
         else:
@@ -343,7 +347,8 @@ class AnomalyDetector:
             'scaler': self.scaler,
             'feature_names': self.feature_names,
             'method': self.method,
-            'contamination': self.contamination
+            'contamination': self.contamination,
+            'score_scale': getattr(self, 'score_scale', None)
         }
         
         joblib.dump(model_data, file_path)
@@ -358,6 +363,7 @@ class AnomalyDetector:
         self.feature_names = model_data['feature_names']
         self.method = model_data['method']
         self.contamination = model_data['contamination']
+        self.score_scale = model_data.get('score_scale')
         self.is_trained = True
         
         self.logger.info(f"Anomaly detection model loaded from {file_path}")

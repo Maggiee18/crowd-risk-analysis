@@ -100,6 +100,32 @@ You can start a simulation from the dashboard or via API:
 curl -X POST http://localhost:8000/api/simulate -H "Content-Type: application/json" -d '{"scenario": "sudden_surge"}'
 ```
 
+## 🧠 Training on the Mall Dataset
+
+All models are trained on the 2000 Mall frames with `data/mall_gt.mat` as ground truth. The first 80% of frames are used for training and the last 20% for testing (a random split would leak near identical neighbouring frames into the test set).
+
+```bash
+python training/extract_detections.py   # YOLO boxes + image features for all frames, cached (~20 min on CPU)
+python training/train_models.py         # trains + evaluates all models, saves to models/
+```
+
+The API and `main.py` load whatever is in `models/` automatically on startup.
+
+| Model | File | Test result (last 400 frames) |
+|---|---|---|
+| Count corrector v2 (YOLO boxes + YOLO backbone image features, ridge, light smoothing) | `count_corrector.npz` | Count error 4.34 (raw YOLO) → 2.42 (boxes only) → **1.71** people per frame; alert level matches ground truth 57% → **83%** |
+| Risk predictor (Random Forest) | `risk_predictor.pkl` | **86%** accuracy, macro F1 0.867 |
+| Anomaly detector (Isolation Forest) | `anomaly_detector.pkl` | Flags 1.5% of test frames; scores calibrated so 1.0 = most unusual training frame |
+| LSTM forecaster (3 model ensemble, next 10 frames) | `lstm/` | Error **3.44** people vs 3.52 for "count stays the same" |
+
+All settings (PCA size, ridge strength, smoothing, LSTM blend) are chosen on a validation slice (frames 1281 to 1600), never on the test frames.
+
+Notes:
+- Risk labels come from the ground truth count (low < 24, medium 24 to 30, high > 30), so the Random Forest cannot do much better than the count itself. To learn real risk, it needs labelled incidents.
+- The Mall video has no real incidents, so the anomaly detector mostly confirms normal behaviour.
+- The scikit-learn pickles were saved with scikit-learn 1.3 / numpy 1.24 (the pinned versions). With any other version they are refit automatically at startup from `models/mall_training_data.npz` (about 1 second), because pickles across versions give wrong probabilities.
+- Full metrics are in `models/training_report.json`.
+
 ## 🐳 Docker
 
 ```bash

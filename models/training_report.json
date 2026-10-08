@@ -1,0 +1,129 @@
+{
+  "count_corrector": {
+    "model": "v2: ridge on box features + PCA of YOLO backbone features, EMA smoothed",
+    "settings": {
+      "pca_components": 96,
+      "ridge_alpha": 10.0,
+      "ema_alpha": 0.7
+    },
+    "validation_mae": {
+      "box_only_v1": 2.89,
+      "v2": 2.03
+    },
+    "test_mae_raw_yolo": 4.34,
+    "test_mae_box_only_v1": 2.42,
+    "test_mae_corrected": 1.71,
+    "test_mean_gt": 32.4,
+    "test_mean_raw": 28.700000762939453,
+    "test_mean_corrected": 33.0,
+    "test_alert_level_match_raw": 0.573,
+    "test_alert_level_match_corrected": 0.833
+  },
+  "risk_predictor": {
+    "test_accuracy": 0.86,
+    "test_macro_f1": 0.867,
+    "rule_on_corrected_count_accuracy": 0.832,
+    "confusion_matrix_rows_true_cols_pred": {
+      "labels": [
+        "low",
+        "medium",
+        "high"
+      ],
+      "matrix": [
+        [
+          9,
+          1,
+          0
+        ],
+        [
+          1,
+          122,
+          42
+        ],
+        [
+          0,
+          12,
+          213
+        ]
+      ]
+    },
+    "test_class_counts": {
+      "low": 10,
+      "medium": 165,
+      "high": 225
+    },
+    "top_features": {
+      "people_count": 0.267,
+      "density_per_frame": 0.254,
+      "area_coverage": 0.111,
+      "avg_count": 0.06,
+      "min_count": 0.047,
+      "movement_concentration": 0.046
+    }
+  },
+  "anomaly_detector": {
+    "train_anomaly_rate": 0.05,
+    "test_anomaly_rate": 0.015,
+    "test_frames_over_alert_threshold_0.6": 0,
+    "score_scale": 0.1033,
+    "most_anomalous_test_frames": [
+      {
+        "frame": 1654,
+        "score": 0.31,
+        "gt_count": 38,
+        "growth_rate": 0.15,
+        "avg_motion": 6.89
+      },
+      {
+        "frame": 1653,
+        "score": 0.25,
+        "gt_count": 44,
+        "growth_rate": 0.23,
+        "avg_motion": 7.25
+      },
+      {
+        "frame": 1657,
+        "score": 0.17,
+        "gt_count": 39,
+        "growth_rate": 0.04,
+        "avg_motion": 6.47
+      },
+      {
+        "frame": 1651,
+        "score": 0.12,
+        "gt_count": 48,
+        "growth_rate": 0.3,
+        "avg_motion": 6.2
+      },
+      {
+        "frame": 1719,
+        "score": 0.04,
+        "gt_count": 37,
+        "growth_rate": 0.47,
+        "avg_motion": 7.77
+      }
+    ]
+  },
+  "lstm_forecaster": {
+    "train_status": "trained",
+    "members": 3,
+    "blend_weight_chosen_on_validation": 0.3,
+    "test_windows": 391,
+    "test_mae_lstm": 3.44,
+    "test_mae_lstm_ensemble_unblended": 3.76,
+    "test_mae_persistence_baseline": 3.52,
+    "test_mae_window_mean_baseline": 4.36,
+    "test_mae_by_horizon_lstm": [
+      2.25,
+      2.71,
+      3.01,
+      3.2,
+      3.42,
+      3.67,
+      3.86,
+      4.04,
+      4.09,
+      4.18
+    ]
+  }
+}

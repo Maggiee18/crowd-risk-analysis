@@ -262,19 +262,26 @@ class CrowdAnalyzer:
         
         return concentration
     
-    def update_frame(self, frame: np.ndarray, detections: List[Dict]) -> Dict:
+    def update_frame(self, frame: np.ndarray, detections: List[Dict],
+                     people_count: Optional[int] = None) -> Dict:
         """
         Update analyzer with new frame data
         
         Args:
             frame: Current frame
             detections: People detections in current frame
+            people_count: Optional calibrated count (e.g. from CountCorrector).
+                Defaults to len(detections).
             
         Returns:
             Dictionary containing all current features
         """
         # Calculate current density metrics
         density_metrics = self.calculate_crowd_density(detections)
+        if people_count is not None and people_count != density_metrics['people_count']:
+            frame_area_m2 = self.frame_shape[0] * self.frame_shape[1] * 0.0001
+            density_metrics['people_count'] = people_count
+            density_metrics['density_per_frame'] = people_count / frame_area_m2 if frame_area_m2 > 0 else 0
         
         # Calculate optical flow if we have previous frame
         optical_flow_features = {}
@@ -283,15 +290,15 @@ class CrowdAnalyzer:
                 self.frame_history[-1], frame
             )
         
-        # Calculate spatio-temporal features
-        spatio_temporal_features = self.calculate_spatio_temporal_features()
-        
-        # Update history
+        # Update history first so trend features include the current frame
         self.frame_history.append(frame.copy())
         self.density_history.append(density_metrics)
         self.count_history.append(density_metrics['people_count'])
         if optical_flow_features:
             self.optical_flow_history.append(optical_flow_features)
+        
+        # Calculate spatio-temporal features (now includes this frame)
+        spatio_temporal_features = self.calculate_spatio_temporal_features()
         
         # Combine all features
         all_features = {
@@ -311,9 +318,15 @@ class CrowdAnalyzer:
         
         return all_features
     
-    def get_feature_vector(self) -> np.ndarray:
+    def get_feature_vector(self, feature_names: Optional[List[str]] = None) -> np.ndarray:
         """
         Get current feature vector for ML prediction
+        
+        Args:
+            feature_names: Columns in the exact order a trained model expects.
+                Without this the column order depends on which features
+                appeared first (optical flow only exists from frame 2), so
+                always pass model.feature_names when a model is trained.
         
         Returns:
             Numpy array of features
@@ -322,7 +335,10 @@ class CrowdAnalyzer:
             return np.array([])
         
         # Get the latest row
-        latest_features = self.features_df.iloc[-1].values
+        if feature_names:
+            latest_features = self.features_df.iloc[-1].reindex(feature_names).values.astype(float)
+        else:
+            latest_features = self.features_df.iloc[-1].values
         
         # Handle any NaN values
         latest_features = np.nan_to_num(latest_features, nan=0.0)

@@ -31,6 +31,7 @@ from analyzer import CrowdAnalyzer
 from predictor import RiskPredictor
 from anomaly_detector import AnomalyDetector
 from optimizer import AlertSystem, HeatmapGenerator, PerformanceMonitor
+from mall_models import load_mall_models
 from tracker import PersonTracker
 from lstm_predictor import LSTMCrowdPredictor
 from rl_controller import CrowdControlAgent
@@ -117,7 +118,8 @@ async def startup():
         model_path = os.path.join(os.path.dirname(__file__), '..', 'yolov8n.pt')
         state.detector = PeopleDetector(
             model_path=model_path if os.path.exists(model_path) else 'yolov8n.pt',
-            confidence_threshold=0.5
+            confidence_threshold=0.15,
+            imgsz=1280
         )
 
         state.analyzer = CrowdAnalyzer(frame_shape=(480, 640), history_length=60)
@@ -154,12 +156,16 @@ async def startup():
         # Performance monitor
         state.perf_monitor = PerformanceMonitor()
 
-        # Try to train LSTM with synthetic data (runs quickly)
-        try:
-            result = state.lstm_predictor.train(epochs=1, n_scenarios=2)
-            logger.info(f"LSTM predictor trained: {result.get('status')}")
-        except Exception as e:
-            logger.warning(f"LSTM training skipped: {e}")
+        # Load models trained by training/train_models.py if they exist
+        _load_trained_models(model_dir)
+
+        # Otherwise fall back to a quick LSTM trained on synthetic data
+        if not state.lstm_predictor.is_trained:
+            try:
+                result = state.lstm_predictor.train(epochs=1, n_scenarios=2)
+                logger.info(f"LSTM predictor trained on synthetic data: {result.get('status')}")
+            except Exception as e:
+                logger.warning(f"LSTM training skipped: {e}")
 
         state.initialized = True
         logger.info("✓ System initialization complete!")
@@ -167,6 +173,31 @@ async def startup():
     except Exception as e:
         logger.error(f"Initialization error: {e}", exc_info=True)
         state.initialized = False
+
+
+def _load_trained_models(model_dir: str):
+    """Load the Mall-trained models from models/ (each one is optional)."""
+    try:
+        models = load_mall_models(model_dir)
+    except Exception as e:
+        logger.warning(f"Could not load trained models: {e}")
+        models = {}
+    if 'count_corrector' in models:
+        state.detector.count_corrector = models['count_corrector']
+        logger.info("Loaded count corrector")
+    if 'risk_predictor' in models:
+        state.risk_predictor = models['risk_predictor']
+        logger.info("Loaded Mall-trained risk predictor")
+    if 'anomaly_detector' in models:
+        state.anomaly_detector = models['anomaly_detector']
+        logger.info("Loaded Mall-trained anomaly detector")
+    lstm_dir = os.path.join(model_dir, 'lstm')
+    if os.path.exists(os.path.join(lstm_dir, 'lstm_meta.json')):
+        try:
+            state.lstm_predictor.load(lstm_dir)
+            logger.info("Loaded Mall-trained LSTM")
+        except Exception as e:
+            logger.warning(f"Could not load LSTM: {e}")
 
 
 # ─── Pydantic models ─────────────────────────────────────────────
@@ -567,8 +598,8 @@ def _process_raw_frame(frame: np.ndarray, sim_detections=None) -> Dict:
         tracks = state.tracker.update(detections, frame=frame)
         tracking_summary = state.tracker.get_tracking_summary()
 
-    # 3. Analyze crowd features
-    features = state.analyzer.update_frame(frame, detections)
+    # 3. Analyze crowd features (count may be calibrated by the count corrector)
+    features = state.analyzer.update_frame(frame, detections, people_count=count)
 
     # 4. Generate heatmap
     heatmap = None
@@ -580,15 +611,18 @@ def _process_raw_frame(frame: np.ndarray, sim_detections=None) -> Dict:
     # 5. Risk prediction
     risk_result = {}
     if state.risk_predictor and state.risk_predictor.is_trained:
-        fv = state.analyzer.get_feature_vector()
+        fv = state.analyzer.get_feature_vector(state.risk_predictor.feature_names)
         if len(fv) > 0:
             risk_level, confidence = state.risk_predictor.predict(fv)
             risk_result = {'risk_level': risk_level, 'confidence': float(confidence)}
 
     # 6. Anomaly detection
     anomaly_result = {}
-    if state.anomaly_detector and state.anomaly_detector.is_trained:
-        fv = state.analyzer.get_feature_vector()
+    # Skip the first frames: trend features need history, and an empty
+    # history looks "anomalous" to a model trained on a running video.
+    warmed_up = len(state.analyzer.count_history) >= 10
+    if state.anomaly_detector and state.anomaly_detector.is_trained and warmed_up:
+        fv = state.analyzer.get_feature_vector(state.anomaly_detector.feature_names)
         if len(fv) > 0:
             is_anomaly, score, details = state.anomaly_detector.detect_anomaly(fv)
             anomaly_result = {
@@ -617,29 +651,34 @@ def _process_raw_frame(frame: np.ndarray, sim_detections=None) -> Dict:
             risk_level=risk_lvl, direction_conflict=conflict
         )
 
+    # Rule-based risk fallback when no model is trained.
+    # Aligned with the capacity alerts so the dashboard badge and the
+    # warnings always agree (medium >= 80% capacity, high > capacity).
+    if not risk_result:
+        cap = state.alert_system.capacity_limit if state.alert_system else 30
+        ratio = state.alert_system.alert_ratio if state.alert_system else 0.8
+        if count > cap:
+            risk_result = {'risk_level': 'high', 'confidence': 0.9}
+        elif count >= cap * ratio:
+            risk_result = {'risk_level': 'medium', 'confidence': 0.7}
+        else:
+            risk_result = {'risk_level': 'low', 'confidence': 0.8}
+
     # 9. Generate alerts
     alerts = []
     if state.alert_system:
-        alerts = state.alert_system.evaluate_risk(risk_result, anomaly_result, features)
-        for alert in alerts:
-            # Make serializable
-            alert['timestamp'] = datetime.now().isoformat()
-            state.alert_log.append(alert)
+        raw_alerts = state.alert_system.evaluate_risk(risk_result, anomaly_result, features)
+        # Copy before making serializable: AlertSystem keeps the originals in
+        # active_alerts and later does `now - alert['timestamp']`, which
+        # crashed with "float - str" once the timestamp became a string.
+        alerts = [{**a, 'timestamp': datetime.now().isoformat()} for a in raw_alerts]
+        state.alert_log.extend(alerts)
 
     proc_time = time.time() - start
     fps = 1.0 / proc_time if proc_time > 0 else 0
 
     if state.perf_monitor:
         state.perf_monitor.update(proc_time, fps)
-
-    # Compute risk-level if model not trained (rule-based fallback)
-    if not risk_result:
-        if count > 25:
-            risk_result = {'risk_level': 'high', 'confidence': 0.7}
-        elif count > 12:
-            risk_result = {'risk_level': 'medium', 'confidence': 0.6}
-        else:
-            risk_result = {'risk_level': 'low', 'confidence': 0.8}
 
     # Make features serializable
     safe_features = {}

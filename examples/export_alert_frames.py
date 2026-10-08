@@ -20,7 +20,7 @@ def main() -> None:
         raise FileNotFoundError("No frames found in data/frames/frames")
 
     os.makedirs("output/alerts", exist_ok=True)
-    detector = PeopleDetector(model_path="yolov8n.pt", confidence_threshold=0.5)
+    detector = PeopleDetector(model_path="yolov8n.pt", confidence_threshold=0.15, imgsz=1280)
 
     best_over_30 = None  # (count, path, annotated)
     best_over_80 = None  # (count, path, annotated)

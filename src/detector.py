@@ -6,25 +6,43 @@ Handles video processing, people detection, and counting
 import cv2
 import numpy as np
 from ultralytics import YOLO
+import os
 import time
 from typing import List, Tuple, Dict
 import logging
+
+from count_corrector import frame_embedding, load_perspective
+
+DEFAULT_PERSPECTIVE = os.path.join(os.path.dirname(__file__), "..", "data", "perspective_roi.mat")
 
 class PeopleDetector:
     """
     A class for detecting people in video frames using YOLOv8
     """
     
-    def __init__(self, model_path: str = "yolov8n.pt", confidence_threshold: float = 0.5):
+    def __init__(self, model_path: str = "yolov8n.pt", confidence_threshold: float = 0.15,
+                 imgsz: int = 1280):
         """
         Initialize the PeopleDetector
         
         Args:
             model_path: Path to YOLOv8 model file
-            confidence_threshold: Minimum confidence for detections
+            confidence_threshold: Minimum confidence for detections.
+                People in the Mall dataset are small and partly occluded, so
+                0.5 misses most of them. 0.15 gave the closest counts to the
+                ground truth in testing.
+            imgsz: Inference resolution. Upscaling 640x480 frames to 1280
+                lets YOLO see the small, distant people.
         """
         self.model = YOLO(model_path)
         self.confidence_threshold = confidence_threshold
+        self.imgsz = imgsz
+        # Optional trained CountCorrector (see src/count_corrector.py).
+        # When set, the returned count is the calibrated one, while the
+        # returned boxes are still the ones above confidence_threshold.
+        self.count_corrector = None
+        self.last_raw_count = 0
+        self._perspective = None  # loaded lazily, only the v2 corrector needs it
         self.person_class_id = 0  # COCO dataset class ID for 'person'
         self.frame_count = 0
         self.detection_history = []
@@ -46,10 +64,19 @@ class PeopleDetector:
             count: Number of people detected
         """
         # Run YOLOv8 inference
-        results = self.model(frame, conf=self.confidence_threshold)
+        use_corrector = self.count_corrector is not None and self.count_corrector.is_trained
+        run_conf = min(self.confidence_threshold, 0.05) if use_corrector else self.confidence_threshold
+        results = self.model(
+            frame,
+            conf=run_conf,
+            imgsz=self.imgsz,
+            classes=[self.person_class_id],
+            verbose=False,
+        )
         
         detections = []
         people_count = 0
+        all_boxes = []
         
         for result in results:
             boxes = result.boxes
@@ -60,6 +87,9 @@ class PeopleDetector:
                         # Get bounding box coordinates
                         x1, y1, x2, y2 = box.xyxy[0].cpu().numpy()
                         confidence = float(box.conf[0].cpu().numpy())
+                        all_boxes.append([x1, y1, x2, y2, confidence])
+                        if confidence < self.confidence_threshold:
+                            continue
                         
                         detection = {
                             'bbox': [int(x1), int(y1), int(x2), int(y2)],
@@ -70,6 +100,17 @@ class PeopleDetector:
                         
                         detections.append(detection)
                         people_count += 1
+        
+        self.last_raw_count = people_count
+        if use_corrector:
+            h, w = frame.shape[:2]
+            emb = None
+            if self.count_corrector.needs_embedding:
+                if self._perspective is None:
+                    self._perspective = load_perspective(DEFAULT_PERSPECTIVE)
+                emb = frame_embedding(self.model, frame, self._perspective)
+            people_count = self.count_corrector.predict(
+                np.array(all_boxes).reshape(-1, 5), h, w, embedding=emb)
         
         return detections, people_count
     

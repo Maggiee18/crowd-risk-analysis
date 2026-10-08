@@ -6,8 +6,10 @@ import os
 import sys
 import cv2
 import numpy as np
+import pandas as pd
 
 # Add src directory to path
+sys.path.append(os.path.join(os.path.dirname(__file__), '..'))  # for main.py
 sys.path.append(os.path.join(os.path.dirname(__file__), '..', 'src'))
 
 from detector import PeopleDetector
@@ -216,6 +218,7 @@ def example_6_real_time_simulation():
     """Example 6: Real-time processing simulation"""
     print("\n=== Example 6: Real-time Processing ===")
     
+    import time
     from optimizer import RealTimeProcessor, PerformanceMonitor
     
     # Initialize system components
@@ -254,8 +257,19 @@ def example_6_real_time_simulation():
                   f"processing time: {result['processing_time']:.3f}s")
         
         # Simulate frame rate
-        import time
         time.sleep(0.1)
+    
+    # Wait for the remaining queued frames to finish
+    deadline = time.time() + 60
+    while processor.frame_buffer.size() > 0 and time.time() < deadline:
+        time.sleep(0.2)
+    while True:
+        result = processor.get_latest_result()
+        if not result:
+            break
+        print(f"Processed frame {result['frame_number']}: "
+              f"{result['people_count']} people, "
+              f"processing time: {result['processing_time']:.3f}s")
     
     # Get performance stats
     stats = processor.get_performance_stats()
