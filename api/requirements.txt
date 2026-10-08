@@ -1,6 +1,6 @@
 flask==2.3.3
 flask-cors==4.0.0
-opencv-python==4.8.1.78
+opencv-python==4.8.1.78  # must stay < 5 (Haar cascades removed in 5.x)
 numpy==1.24.3
 pandas==2.0.3
 scikit-learn==1.3.0

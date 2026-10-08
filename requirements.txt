@@ -1,4 +1,4 @@
-opencv-python==4.8.1.78
+opencv-python==4.8.1.78  # must stay < 5 (Haar cascades removed in 5.x)
 ultralytics==8.0.196
 numpy==1.24.3
 pandas==2.0.3

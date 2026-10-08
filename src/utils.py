@@ -14,13 +14,25 @@ from datetime import datetime
 
 def ensure_dir(directory: str) -> None:
     """Create directory if it doesn't exist"""
-    if not os.path.exists(directory):
-        os.makedirs(directory)
+    if directory:
+        os.makedirs(directory, exist_ok=True)
+
+def _json_default(o):
+    """Convert numpy types (int64, float32, arrays, bools) for json.dump"""
+    if isinstance(o, np.integer):
+        return int(o)
+    if isinstance(o, np.floating):
+        return float(o)
+    if isinstance(o, np.bool_):
+        return bool(o)
+    if isinstance(o, np.ndarray):
+        return o.tolist()
+    raise TypeError(f'Object of type {o.__class__.__name__} is not JSON serializable')
 
 def save_json(data: Dict, file_path: str) -> None:
     """Save dictionary to JSON file"""
     with open(file_path, 'w') as f:
-        json.dump(data, f, indent=2)
+        json.dump(data, f, indent=2, default=_json_default)
 
 def load_json(file_path: str) -> Dict:
     """Load dictionary from JSON file"""

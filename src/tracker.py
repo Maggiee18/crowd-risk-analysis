@@ -215,9 +215,15 @@ class PersonTracker:
         self.use_deep_sort = use_deep_sort and DEEPSORT_AVAILABLE
 
         if self.use_deep_sort:
-            self.tracker = DeepSORTWrapper(max_age=max_disappeared)
-            logger.info("Using Deep SORT tracker")
-        else:
+            try:
+                self.tracker = DeepSORTWrapper(max_age=max_disappeared)
+                logger.info("Using Deep SORT tracker")
+            except Exception as e:
+                # e.g. deep_sort_realtime needs pkg_resources, which newer
+                # setuptools no longer ships. Don't let that kill the server.
+                logger.warning(f"Deep SORT unavailable ({e}), using centroid tracker")
+                self.use_deep_sort = False
+        if not self.use_deep_sort:
             self.tracker = CentroidTracker(max_disappeared=max_disappeared)
             logger.info("Using Centroid tracker")
 

@@ -4,8 +4,8 @@
 FROM node:18-alpine AS frontend-build
 
 WORKDIR /app/frontend
-COPY frontend/package.json frontend/package-lock.json* ./
-RUN npm install --legacy-peer-deps
+COPY frontend/package.json frontend/package-lock.json ./
+RUN npm ci
 COPY frontend/ ./
 RUN npm run build
 
@@ -16,14 +16,18 @@ FROM python:3.10-slim
 
 WORKDIR /app
 
-# System deps (OpenCV needs these)
+# System deps (OpenCV needs these; libgl1-mesa-glx no longer exists in
+# current Debian, libgl1 replaces it). curl is used by the healthcheck.
 RUN apt-get update && apt-get install -y --no-install-recommends \
-    libgl1-mesa-glx libglib2.0-0 libsm6 libxrender1 libxext6 \
+    libgl1 libglib2.0-0 libsm6 libxrender1 libxext6 curl \
     && rm -rf /var/lib/apt/lists/*
 
 # Python deps
+# Root requirements are the core ML stack; api/requirements.txt adds
+# FastAPI, uvicorn, Deep SORT and torch, which the server needs.
 COPY requirements.txt .
-RUN pip install --no-cache-dir -r requirements.txt
+COPY api/requirements.txt ./api-requirements.txt
+RUN pip install --no-cache-dir -r requirements.txt -r api-requirements.txt
 
 # Copy source code
 COPY src/ ./src/
@@ -35,7 +39,8 @@ COPY main.py .
 COPY yolov8n.pt* ./
 
 # Copy built frontend
-COPY --from=frontend-build /app/frontend/build ./frontend/build
+# Vite builds to dist/, not build/
+COPY --from=frontend-build /app/frontend/dist ./frontend/dist
 
 # Create output dirs
 RUN mkdir -p models output data

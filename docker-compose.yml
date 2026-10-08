@@ -29,9 +29,11 @@ services:
     ports:
       - "3000:3000"
     environment:
-      - REACT_APP_API_URL=http://localhost:8000
-      - REACT_APP_WS_URL=ws://localhost:8000/ws
-    command: sh -c "npm install --legacy-peer-deps && npm start"
+      # Vite only exposes VITE_* variables to the app
+      - VITE_API_URL=http://localhost:8000
+      - VITE_WS_URL=ws://localhost:8000/ws
+    # there is no "start" script; vite dev server must listen on 0.0.0.0
+    command: sh -c "npm ci && npm run dev -- --host 0.0.0.0 --port 3000"
     depends_on:
       - backend
     restart: unless-stopped

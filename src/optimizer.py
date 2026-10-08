@@ -112,6 +112,9 @@ class RealTimeProcessor:
         # Processing state
         self.is_running = False
         self.processing_thread = None
+        self.frame_counter = 0
+        # Max seconds to wait for one frame (1280px CPU inference can take ~1s)
+        self.frame_timeout = 30.0
         
         # Logging
         logging.basicConfig(level=logging.INFO)
@@ -123,7 +126,8 @@ class RealTimeProcessor:
             return
         
         self.is_running = True
-        self.processing_thread = threading.Thread(target=self._processing_loop)
+        # daemon=True so a crash in the caller can't leave the process hanging
+        self.processing_thread = threading.Thread(target=self._processing_loop, daemon=True)
         self.processing_thread.start()
         self.logger.info("Real-time processing started")
     
@@ -152,7 +156,11 @@ class RealTimeProcessor:
             try:
                 # Process frame asynchronously
                 future = self.executor.submit(self._process_frame, frame, timestamp)
-                result = future.result(timeout=1.0)
+                result = future.result(timeout=self.frame_timeout)
+                
+                self.frame_counter += 1
+                result['frame_number'] = self.frame_counter
+                result['processing_time'] = time.time() - start_time
                 
                 # Add result to queue
                 if not self.result_queue.full():
@@ -163,6 +171,10 @@ class RealTimeProcessor:
                 fps = 1.0 / processing_time if processing_time > 0 else 0
                 self.performance_monitor.update(processing_time, fps)
                 
+            except RuntimeError as e:
+                # Executor was shut down (e.g. interpreter exiting): stop the loop
+                self.logger.error(f"Stopping processing loop: {e}")
+                self.is_running = False
             except Exception as e:
                 self.logger.error(f"Error processing frame: {e}")
     

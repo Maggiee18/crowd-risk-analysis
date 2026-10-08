@@ -292,6 +292,9 @@ class CrowdRiskSystem:
                 # Process frame
                 result = self._process_frame(frame, frame_count, fps)
                 frame_results.append(result)
+                if self.performance_monitor:
+                    pt = result['processing_time']
+                    self.performance_monitor.update(pt, 1.0 / pt if pt > 0 else 0)
                 
                 # Draw annotations
                 annotated_frame = self._draw_annotations(frame, result)
@@ -448,6 +451,18 @@ class CrowdRiskSystem:
                         'details': details
                     }
         
+        # Rule-based risk fallback when no model is trained (same rule as the
+        # API): medium at >= 80% of capacity, high once capacity is exceeded.
+        if not risk_result:
+            cap = self.config['alerts'].get('capacity_limit', 30)
+            ratio = self.config['alerts'].get('capacity_alert_ratio', 0.8)
+            if count > cap:
+                risk_result = {'risk_level': 'high', 'confidence': 0.9}
+            elif count >= cap * ratio:
+                risk_result = {'risk_level': 'medium', 'confidence': 0.7}
+            else:
+                risk_result = {'risk_level': 'low', 'confidence': 0.8}
+
         # Generate alerts
         alerts = []
         if self.alert_system:
@@ -693,6 +708,7 @@ def main():
     # Update output directory if specified
     if args.output:
         system.config['output']['output_dir'] = args.output
+        ensure_dir(args.output)
     
     # Train models if requested
     if args.train:
