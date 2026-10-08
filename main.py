@@ -63,7 +63,8 @@ class CrowdRiskSystem:
         default_config = {
             'detection': {
                 'model_path': 'yolov8n.pt',
-                'confidence_threshold': 0.5,
+                'confidence_threshold': 0.15,
+                'imgsz': 1280,
                 'max_detections': 100
             },
             'analysis': {
@@ -130,7 +131,8 @@ class CrowdRiskSystem:
             print("Initializing people detector...")
             self.detector = PeopleDetector(
                 model_path=self.config['detection']['model_path'],
-                confidence_threshold=self.config['detection']['confidence_threshold']
+                confidence_threshold=self.config['detection']['confidence_threshold'],
+                imgsz=self.config['detection'].get('imgsz', 1280)
             )
             
             # Initialize analyzer

@@ -434,7 +434,10 @@ class AlertSystem:
         
         # Check for sudden changes
         if features:
-            count = features.get('current_count', 0)
+            # 'people_count' is this frame's count. 'current_count' comes from the
+            # history *before* this frame was added, so it lags one frame behind
+            # (and is 0 for the first 3 frames).
+            count = features.get('people_count', features.get('current_count', 0))
             growth_rate = features.get('growth_rate', 0)
             volatility = features.get('volatility', 0)
             avg_count = features.get('avg_count', 0)
@@ -451,25 +454,40 @@ class AlertSystem:
                 }
                 alerts.append(alert)
             
-            # Capacity-based alert (Mall dataset requirement)
-            capacity_threshold = self.capacity_limit * self.alert_ratio
-            if count >= capacity_threshold:
-                utilization = (count / self.capacity_limit) * 100 if self.capacity_limit > 0 else 0
-                alert = {
-                    'type': 'capacity_threshold',
-                    'severity': 'critical',
-                    'message': (
-                        f'Crowd reached {utilization:.1f}% of capacity '
-                        f'({count}/{self.capacity_limit}). Take immediate action.'
-                    ),
-                    'timestamp': current_time,
-                    'data': {
-                        'count': count,
-                        'capacity_limit': self.capacity_limit,
-                        'capacity_utilization_percent': utilization
-                    }
-                }
-                alerts.append(alert)
+            # Capacity-based alerts (Mall dataset requirement)
+            # WARNING at >= 80% of capacity, CRITICAL once capacity is exceeded.
+            if self.capacity_limit > 0:
+                utilization = (count / self.capacity_limit) * 100
+                if count > self.capacity_limit:
+                    alerts.append({
+                        'type': 'capacity_exceeded',
+                        'severity': 'critical',
+                        'message': (
+                            f'Capacity exceeded: {count}/{self.capacity_limit} people '
+                            f'({utilization:.1f}%). Take immediate action.'
+                        ),
+                        'timestamp': current_time,
+                        'data': {
+                            'count': count,
+                            'capacity_limit': self.capacity_limit,
+                            'capacity_utilization_percent': utilization
+                        }
+                    })
+                elif count >= self.capacity_limit * self.alert_ratio:
+                    alerts.append({
+                        'type': 'capacity_threshold',
+                        'severity': 'warning',
+                        'message': (
+                            f'Crowd reached {utilization:.1f}% of capacity '
+                            f'({count}/{self.capacity_limit}). Prepare crowd control.'
+                        ),
+                        'timestamp': current_time,
+                        'data': {
+                            'count': count,
+                            'capacity_limit': self.capacity_limit,
+                            'capacity_utilization_percent': utilization
+                        }
+                    })
 
             # Gradually rising crowd warning
             if (

@@ -117,7 +117,8 @@ async def startup():
         model_path = os.path.join(os.path.dirname(__file__), '..', 'yolov8n.pt')
         state.detector = PeopleDetector(
             model_path=model_path if os.path.exists(model_path) else 'yolov8n.pt',
-            confidence_threshold=0.5
+            confidence_threshold=0.15,
+            imgsz=1280
         )
 
         state.analyzer = CrowdAnalyzer(frame_shape=(480, 640), history_length=60)
@@ -617,6 +618,19 @@ def _process_raw_frame(frame: np.ndarray, sim_detections=None) -> Dict:
             risk_level=risk_lvl, direction_conflict=conflict
         )
 
+    # Rule-based risk fallback when no model is trained.
+    # Aligned with the capacity alerts so the dashboard badge and the
+    # warnings always agree (medium >= 80% capacity, high > capacity).
+    if not risk_result:
+        cap = state.alert_system.capacity_limit if state.alert_system else 30
+        ratio = state.alert_system.alert_ratio if state.alert_system else 0.8
+        if count > cap:
+            risk_result = {'risk_level': 'high', 'confidence': 0.9}
+        elif count >= cap * ratio:
+            risk_result = {'risk_level': 'medium', 'confidence': 0.7}
+        else:
+            risk_result = {'risk_level': 'low', 'confidence': 0.8}
+
     # 9. Generate alerts
     alerts = []
     if state.alert_system:
@@ -631,15 +645,6 @@ def _process_raw_frame(frame: np.ndarray, sim_detections=None) -> Dict:
 
     if state.perf_monitor:
         state.perf_monitor.update(proc_time, fps)
-
-    # Compute risk-level if model not trained (rule-based fallback)
-    if not risk_result:
-        if count > 25:
-            risk_result = {'risk_level': 'high', 'confidence': 0.7}
-        elif count > 12:
-            risk_result = {'risk_level': 'medium', 'confidence': 0.6}
-        else:
-            risk_result = {'risk_level': 'low', 'confidence': 0.8}
 
     # Make features serializable
     safe_features = {}

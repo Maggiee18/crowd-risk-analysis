@@ -15,16 +15,23 @@ class PeopleDetector:
     A class for detecting people in video frames using YOLOv8
     """
     
-    def __init__(self, model_path: str = "yolov8n.pt", confidence_threshold: float = 0.5):
+    def __init__(self, model_path: str = "yolov8n.pt", confidence_threshold: float = 0.15,
+                 imgsz: int = 1280):
         """
         Initialize the PeopleDetector
         
         Args:
             model_path: Path to YOLOv8 model file
-            confidence_threshold: Minimum confidence for detections
+            confidence_threshold: Minimum confidence for detections.
+                People in the Mall dataset are small and partly occluded, so
+                0.5 misses most of them. 0.15 gave the closest counts to the
+                ground truth in testing.
+            imgsz: Inference resolution. Upscaling 640x480 frames to 1280
+                lets YOLO see the small, distant people.
         """
         self.model = YOLO(model_path)
         self.confidence_threshold = confidence_threshold
+        self.imgsz = imgsz
         self.person_class_id = 0  # COCO dataset class ID for 'person'
         self.frame_count = 0
         self.detection_history = []
@@ -46,7 +53,13 @@ class PeopleDetector:
             count: Number of people detected
         """
         # Run YOLOv8 inference
-        results = self.model(frame, conf=self.confidence_threshold)
+        results = self.model(
+            frame,
+            conf=self.confidence_threshold,
+            imgsz=self.imgsz,
+            classes=[self.person_class_id],
+            verbose=False,
+        )
         
         detections = []
         people_count = 0

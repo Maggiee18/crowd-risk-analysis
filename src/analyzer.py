@@ -283,15 +283,15 @@ class CrowdAnalyzer:
                 self.frame_history[-1], frame
             )
         
-        # Calculate spatio-temporal features
-        spatio_temporal_features = self.calculate_spatio_temporal_features()
-        
-        # Update history
+        # Update history first so trend features include the current frame
         self.frame_history.append(frame.copy())
         self.density_history.append(density_metrics)
         self.count_history.append(density_metrics['people_count'])
         if optical_flow_features:
             self.optical_flow_history.append(optical_flow_features)
+        
+        # Calculate spatio-temporal features (now includes this frame)
+        spatio_temporal_features = self.calculate_spatio_temporal_features()
         
         # Combine all features
         all_features = {

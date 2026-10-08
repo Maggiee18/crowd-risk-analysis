@@ -18,7 +18,7 @@ def main() -> None:
     output_video = "output/mall_detection_preview.mp4"
     output_csv = "output/mall_detection_counts.csv"
 
-    detector = PeopleDetector(model_path="yolov8n.pt", confidence_threshold=0.5)
+    detector = PeopleDetector(model_path="yolov8n.pt", confidence_threshold=0.15, imgsz=1280)
     writer = None
     rows = [("frame", "people_count")]
 
