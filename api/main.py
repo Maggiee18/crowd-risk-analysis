@@ -413,11 +413,30 @@ async def start_simulation(req: SimulationRequest):
     if not state.simulator:
         raise HTTPException(status_code=503, detail="Simulator not available")
 
+    # Stop a simulation that is already running, otherwise two loops would
+    # step the same simulator at once.
+    old_task = getattr(state, 'sim_task', None)
+    if old_task is not None and not old_task.done():
+        state.simulation_active = False
+        state.simulator.is_running = False
+        try:
+            await asyncio.wait_for(old_task, timeout=5)
+        except Exception:
+            old_task.cancel()
+
+    # Start from a clean history so the previous video/scenario doesn't
+    # leak into this one's trend features, alerts and forecasts.
+    state.analyzer.reset()
+    if state.tracker and hasattr(state.tracker, 'reset'):
+        state.tracker.reset()
+    if state.lstm_predictor:
+        state.lstm_predictor._history.clear()
+
     state.simulation_active = True
     config = state.simulator.start_scenario(req.scenario)
 
     # Run simulation in background
-    asyncio.create_task(_run_simulation())
+    state.sim_task = asyncio.create_task(_run_simulation())
 
     return {
         "status": "started",
@@ -608,9 +627,14 @@ def _process_raw_frame(frame: np.ndarray, sim_detections=None) -> Dict:
         if heatmap_raw is not None and np.max(heatmap_raw) > 0:
             heatmap = heatmap_raw.tolist()
 
+    # The risk and anomaly models were trained on the real Mall camera.
+    # Simulated frames look nothing like it (every frame came out as an
+    # "anomaly"), so simulations use the count-based rules instead.
+    real_camera = sim_detections is None
+
     # 5. Risk prediction
     risk_result = {}
-    if state.risk_predictor and state.risk_predictor.is_trained:
+    if real_camera and state.risk_predictor and state.risk_predictor.is_trained:
         fv = state.analyzer.get_feature_vector(state.risk_predictor.feature_names)
         if len(fv) > 0:
             risk_level, confidence = state.risk_predictor.predict(fv)
@@ -621,7 +645,7 @@ def _process_raw_frame(frame: np.ndarray, sim_detections=None) -> Dict:
     # Skip the first frames: trend features need history, and an empty
     # history looks "anomalous" to a model trained on a running video.
     warmed_up = len(state.analyzer.count_history) >= 10
-    if state.anomaly_detector and state.anomaly_detector.is_trained and warmed_up:
+    if real_camera and state.anomaly_detector and state.anomaly_detector.is_trained and warmed_up:
         fv = state.analyzer.get_feature_vector(state.anomaly_detector.feature_names)
         if len(fv) > 0:
             is_anomaly, score, details = state.anomaly_detector.detect_anomaly(fv)
