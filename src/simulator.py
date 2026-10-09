@@ -271,8 +271,11 @@ class CrowdSimulator:
             if len(self.people) > 0 and np.random.random() < config['despawn_rate']:
                 self.people.pop(np.random.randint(len(self.people)))
 
-        # Update all people
-        dt = (1.0 / self.fps) * steps
+        # Update all people. Velocities are in pixels per frame, so dt is the
+        # number of frames advanced. (It used to be seconds, 1/15 per frame:
+        # people moved ~0.2 px per frame, which int() rounding turned into
+        # zero, so the crowd stood still and even "panic" barely moved.)
+        dt = float(steps)
         for person in self.people:
             person.update(dt=dt, panic=panic)
 

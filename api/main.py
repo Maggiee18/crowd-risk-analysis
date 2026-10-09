@@ -33,6 +33,7 @@ from anomaly_detector import AnomalyDetector
 from optimizer import AlertSystem, HeatmapGenerator, PerformanceMonitor
 from mall_models import load_mall_models
 from tracker import PersonTracker
+from panic_detector import PanicDetector
 from lstm_predictor import LSTMCrowdPredictor
 from rl_controller import CrowdControlAgent
 from privacy import PrivacyFilter
@@ -71,6 +72,8 @@ class SystemState:
         self.privacy_filter: Optional[PrivacyFilter] = None
         self.simulator: Optional[CrowdSimulator] = None
         self.alert_system: Optional[AlertSystem] = None
+        self.panic_detector: Optional[PanicDetector] = None
+        self.current_panic: Dict = {}
         self.heatmap_gen: Optional[HeatmapGenerator] = None
         self.perf_monitor: Optional[PerformanceMonitor] = None
 
@@ -130,6 +133,7 @@ async def startup():
 
         # Multi-object tracker
         state.tracker = PersonTracker(use_deep_sort=True, max_disappeared=30)
+        state.panic_detector = PanicDetector()
 
         # LSTM predictor
         state.lstm_predictor = LSTMCrowdPredictor(window_size=30, prediction_steps=10)
@@ -426,11 +430,7 @@ async def start_simulation(req: SimulationRequest):
 
     # Start from a clean history so the previous video/scenario doesn't
     # leak into this one's trend features, alerts and forecasts.
-    state.analyzer.reset()
-    if state.tracker and hasattr(state.tracker, 'reset'):
-        state.tracker.reset()
-    if state.lstm_predictor:
-        state.lstm_predictor._history.clear()
+    _reset_stream_state('simulation')
 
     state.simulation_active = True
     config = state.simulator.start_scenario(req.scenario)
@@ -581,6 +581,26 @@ async def broadcast_ws(data: dict):
 
 
 # ─── Frame Processing Core ──────────────────────────────────────
+def _reset_stream_state(source: str):
+    """
+    Forget all per-stream history: trends, tracks, motion baseline, forecast
+    window, count smoothing. Called when a simulation starts and whenever the
+    input switches between simulation and camera/video, because e.g. the
+    panic detector's idea of "normal speed" from drawn simulation people
+    makes real shoppers look like they are running.
+    """
+    state.analyzer.reset()
+    if state.tracker is not None:
+        state.tracker = PersonTracker(use_deep_sort=state.tracker.use_deep_sort, max_disappeared=30)
+    if state.panic_detector is not None:
+        state.panic_detector.reset()
+    if state.lstm_predictor is not None:
+        state.lstm_predictor._history.clear()
+    cc = getattr(state.detector, 'count_corrector', None) if state.detector else None
+    if cc is not None and hasattr(cc, 'reset'):
+        cc.reset()
+    state.stream_source = source
+
 def _process_frame_internal(image_b64: str) -> Dict:
     """Core frame processing pipeline."""
     start = time.time()
@@ -598,10 +618,14 @@ def _process_frame_internal(image_b64: str) -> Dict:
     return _process_raw_frame(frame)
 
 
-def _process_raw_frame(frame: np.ndarray, sim_detections=None) -> Dict:
+def _process_raw_frame(frame: np.ndarray, sim_detections=None, frames_elapsed: float = 1.0) -> Dict:
     """Process a raw numpy frame through the full pipeline."""
     start = time.time()
     state.frame_count += 1
+
+    source = 'simulation' if sim_detections is not None else 'camera'
+    if getattr(state, 'stream_source', None) != source:
+        _reset_stream_state(source)
 
     # 1. Detect people
     if sim_detections is not None:
@@ -616,6 +640,12 @@ def _process_raw_frame(frame: np.ndarray, sim_detections=None) -> Dict:
     if state.tracker:
         tracks = state.tracker.update(detections, frame=frame)
         tracking_summary = state.tracker.get_tracking_summary()
+
+    # 2b. Panic detection from movement (works for camera, video and simulation)
+    panic = {}
+    if state.panic_detector is not None and state.tracker:
+        panic = state.panic_detector.update(tracks, frames_elapsed=frames_elapsed)
+    state.current_panic = panic
 
     # 3. Analyze crowd features (count may be calibrated by the count corrector)
     features = state.analyzer.update_frame(frame, detections, people_count=count)
@@ -688,10 +718,16 @@ def _process_raw_frame(frame: np.ndarray, sim_detections=None) -> Dict:
         else:
             risk_result = {'risk_level': 'low', 'confidence': 0.8}
 
+    # Panic overrides the risk level: a panicking crowd is high risk at any size
+    if panic.get('is_panic'):
+        risk_result = {**risk_result, 'risk_level': 'high',
+                       'confidence': max(float(risk_result.get('confidence', 0)), 0.9),
+                       'reason': 'panic'}
+
     # 9. Generate alerts
     alerts = []
     if state.alert_system:
-        raw_alerts = state.alert_system.evaluate_risk(risk_result, anomaly_result, features)
+        raw_alerts = state.alert_system.evaluate_risk(risk_result, anomaly_result, {**features, 'panic': panic})
         # Copy before making serializable: AlertSystem keeps the originals in
         # active_alerts and later does `now - alert['timestamp']`, which
         # crashed with "float - str" once the timestamp became a string.
@@ -755,6 +791,7 @@ def _process_raw_frame(frame: np.ndarray, sim_detections=None) -> Dict:
         'predictions': predictions,
         'control_suggestions': suggestions,
         'alerts': alerts,
+        'panic': panic,
         'tracking_summary': {
             k: (float(v) if isinstance(v, (np.floating, np.integer)) else v)
             for k, v in tracking_summary.items()
@@ -788,7 +825,8 @@ async def _run_simulation():
         frame = data.get('frame')
         if frame is not None:
             # Process through full pipeline
-            result = _process_raw_frame(frame, sim_detections=data.get('detections'))
+            result = _process_raw_frame(frame, sim_detections=data.get('detections'),
+                                        frames_elapsed=steps)
 
             # Add simulation-specific info
             result['simulation'] = {
