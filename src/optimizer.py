@@ -444,6 +444,22 @@ class AlertSystem:
                 }
                 alerts.append(alert)
         
+        # Panic: sudden fast, scattered (or rushing) movement, see panic_detector.py
+        panic = (features or {}).get('panic') or {}
+        if panic.get('is_panic'):
+            if panic.get('kind') == 'scatter':
+                msg = 'Panic detected: people are suddenly running in all directions. Act immediately.'
+            else:
+                msg = 'Sudden rush detected: the crowd is suddenly running the same way. Act immediately.'
+            alerts.append({
+                'type': 'panic',
+                'severity': 'critical',
+                'message': msg,
+                'timestamp': current_time,
+                'data': {k: panic.get(k) for k in
+                         ('kind', 'fast_fraction', 'speed_ratio', 'coherence', 'tracked')}
+            })
+
         # Check for sudden changes
         if features:
             # 'people_count' is this frame's count. 'current_count' comes from the
