@@ -460,6 +460,22 @@ class AlertSystem:
                          ('kind', 'fast_fraction', 'speed_ratio', 'coherence', 'tracked')}
             })
 
+        # Evacuation: a large crowd emptying out fast, see evacuation_detector.py
+        evac = (features or {}).get('evacuation') or {}
+        if evac.get('is_evacuation'):
+            alerts.append({
+                'type': 'evacuation',
+                'severity': 'critical',
+                'message': (
+                    f"Rapid evacuation: the crowd fell from {evac.get('peak_count')} to "
+                    f"{evac.get('current_count')} people in {evac.get('seconds_since_peak')} s. "
+                    "Check for an incident and keep the exits clear."
+                ),
+                'timestamp': current_time,
+                'data': {k: evac.get(k) for k in
+                         ('peak_count', 'current_count', 'drop', 'trend', 'seconds_since_peak')}
+            })
+
         # Check for sudden changes
         if features:
             # 'people_count' is this frame's count. 'current_count' comes from the

@@ -137,6 +137,18 @@ Notes:
 
 Results: the Panic Event simulation is caught on 98% of its panic frames, within about 4 to 6 frames (under half a second). There are **zero false alarms** on all 2000 real Mall frames and in the calm simulations. Tests are in `tests/test_panic_detector.py`.
 
+## 🚪 Evacuation Detection
+
+`src/evacuation_detector.py` raises a **CRITICAL evacuation alert** when a large crowd empties out fast. That can point to an incident even when the movement itself doesn't look like panic. All of these must hold for 2 seconds:
+
+- the crowd had at least 15 people in the last 10 seconds
+- it has since lost **at least 60%** of them
+- the decline is steady, not a dip (rank correlation of count vs time of -0.7 or lower)
+
+Real venues swing a lot as groups walk in and out of view. In the Mall video the count drops by more than 50% within 10 seconds dozens of times, so a simple percentage rule is not enough. Time is measured in seconds, so this works at any frame rate.
+
+Results: the Evacuation simulation is flagged 9 to 14 seconds into its 25 second run in every test run. There are **zero false alarms** in all other scenarios and on all 2000 real Mall frames, for both our counts and the ground truth counts. Tests are in `tests/test_evacuation_detector.py`.
+
 ## 🐳 Docker
 
 ```bash

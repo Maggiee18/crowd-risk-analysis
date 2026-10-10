@@ -34,6 +34,7 @@ from optimizer import AlertSystem, HeatmapGenerator, PerformanceMonitor
 from mall_models import load_mall_models
 from tracker import PersonTracker
 from panic_detector import PanicDetector
+from evacuation_detector import EvacuationDetector
 from lstm_predictor import LSTMCrowdPredictor
 from rl_controller import CrowdControlAgent
 from privacy import PrivacyFilter
@@ -73,6 +74,8 @@ class SystemState:
         self.simulator: Optional[CrowdSimulator] = None
         self.alert_system: Optional[AlertSystem] = None
         self.panic_detector: Optional[PanicDetector] = None
+        self.evacuation_detector: Optional[EvacuationDetector] = None
+        self.stream_time = 0.0
         self.current_panic: Dict = {}
         self.heatmap_gen: Optional[HeatmapGenerator] = None
         self.perf_monitor: Optional[PerformanceMonitor] = None
@@ -134,6 +137,7 @@ async def startup():
         # Multi-object tracker
         state.tracker = PersonTracker(use_deep_sort=True, max_disappeared=30)
         state.panic_detector = PanicDetector()
+        state.evacuation_detector = EvacuationDetector()
 
         # LSTM predictor
         state.lstm_predictor = LSTMCrowdPredictor(window_size=30, prediction_steps=10)
@@ -594,6 +598,9 @@ def _reset_stream_state(source: str):
         state.tracker = PersonTracker(use_deep_sort=state.tracker.use_deep_sort, max_disappeared=30)
     if state.panic_detector is not None:
         state.panic_detector.reset()
+    if state.evacuation_detector is not None:
+        state.evacuation_detector.reset()
+    state.stream_time = 0.0
     if state.lstm_predictor is not None:
         state.lstm_predictor._history.clear()
     cc = getattr(state.detector, 'count_corrector', None) if state.detector else None
@@ -646,6 +653,18 @@ def _process_raw_frame(frame: np.ndarray, sim_detections=None, frames_elapsed: f
     if state.panic_detector is not None and state.tracker:
         panic = state.panic_detector.update(tracks, frames_elapsed=frames_elapsed)
     state.current_panic = panic
+
+    # 2c. Evacuation detection from the count. Time in seconds: simulation
+    # time for simulations, wall clock for a camera or video.
+    if sim_detections is not None:
+        sim_fps = getattr(state.simulator, 'fps', 15) or 15
+        state.stream_time += frames_elapsed / sim_fps
+        t_now = state.stream_time
+    else:
+        t_now = time.time()
+    evacuation = {}
+    if state.evacuation_detector is not None:
+        evacuation = state.evacuation_detector.update(count, t_now)
 
     # 3. Analyze crowd features (count may be calibrated by the count corrector)
     features = state.analyzer.update_frame(frame, detections, people_count=count)
@@ -718,7 +737,12 @@ def _process_raw_frame(frame: np.ndarray, sim_detections=None, frames_elapsed: f
         else:
             risk_result = {'risk_level': 'low', 'confidence': 0.8}
 
-    # Panic overrides the risk level: a panicking crowd is high risk at any size
+    # Panic or a rapid evacuation overrides the risk level: both point to an
+    # incident, whatever the crowd size
+    if evacuation.get('is_evacuation') and not panic.get('is_panic'):
+        risk_result = {**risk_result, 'risk_level': 'high',
+                       'confidence': max(float(risk_result.get('confidence', 0)), 0.85),
+                       'reason': 'evacuation'}
     if panic.get('is_panic'):
         risk_result = {**risk_result, 'risk_level': 'high',
                        'confidence': max(float(risk_result.get('confidence', 0)), 0.9),
@@ -727,7 +751,7 @@ def _process_raw_frame(frame: np.ndarray, sim_detections=None, frames_elapsed: f
     # 9. Generate alerts
     alerts = []
     if state.alert_system:
-        raw_alerts = state.alert_system.evaluate_risk(risk_result, anomaly_result, {**features, 'panic': panic})
+        raw_alerts = state.alert_system.evaluate_risk(risk_result, anomaly_result, {**features, 'panic': panic, 'evacuation': evacuation})
         # Copy before making serializable: AlertSystem keeps the originals in
         # active_alerts and later does `now - alert['timestamp']`, which
         # crashed with "float - str" once the timestamp became a string.
@@ -792,6 +816,7 @@ def _process_raw_frame(frame: np.ndarray, sim_detections=None, frames_elapsed: f
         'control_suggestions': suggestions,
         'alerts': alerts,
         'panic': panic,
+        'evacuation': evacuation,
         'tracking_summary': {
             k: (float(v) if isinstance(v, (np.floating, np.integer)) else v)
             for k, v in tracking_summary.items()
