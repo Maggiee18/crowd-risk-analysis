@@ -7,7 +7,7 @@ Channels (either or both):
 
 Behaviour:
 - only alerts at or above `min_severity` are sent (default: critical)
-- each kind of alert (type + zone) is sent when it starts, then at most once
+- each kind of alert (type + camera + zone) is sent when it starts, then at most once
   every `cooldown_seconds` while it keeps going (default 300 s), so a crowd
   that stays over capacity does not flood your phone
 - sending runs in a background thread; a slow or failing network never
@@ -61,7 +61,7 @@ TELEGRAM_API = os.environ.get("CROWDGUARD_TELEGRAM_API", "https://api.telegram.o
 
 def _alert_key(alert: Dict) -> str:
     data = alert.get("data") or {}
-    return f"{alert.get('type')}:{data.get('zone', '')}"
+    return f"{alert.get('type')}:{alert.get('camera', '')}:{data.get('zone', '')}"
 
 
 class Notifier:
@@ -176,7 +176,8 @@ class Notifier:
         lines = [f"🚨 {site}: {len(alerts)} alert{'s' if len(alerts) > 1 else ''}"
                  + (f" ({context})" if context else "")]
         for a in alerts:
-            lines.append(f"• [{a.get('severity', '').upper()}] {a.get('message', a.get('type'))}")
+            where = f"{a['camera_name']}: " if a.get("camera_name") and a.get("camera") != "main" else ""
+            lines.append(f"• [{a.get('severity', '').upper()}] {where}{a.get('message', a.get('type'))}")
         lines.append(time.strftime("%d %b %Y, %H:%M:%S"))
         return "\n".join(lines)
 

@@ -36,8 +36,16 @@ export const setSession = (s) => {
 };
 export const setUnauthorizedHandler = (fn) => { onUnauthorized = fn; };
 
+// ── Camera ──────────────────────────────────────────────────────
+// Every request is about the camera picked in the dashboard (?camera=...),
+// unless it names one itself. Endpoints without cameras ignore it.
+let activeCamera = 'main';
+export const getCamera = () => activeCamera;
+export const setCamera = (id) => { activeCamera = id || 'main'; };
+
 api.interceptors.request.use((config) => {
   if (session && session.token) config.headers.Authorization = `Bearer ${session.token}`;
+  config.params = { camera: activeCamera, ...(config.params || {}) };
   return config;
 });
 
@@ -82,8 +90,15 @@ export const startSimulation = (scenario) => api.post('/simulate', { scenario })
 export const stopSimulation = () => api.post('/simulate/stop');
 
 // ── Frame Processing ────────────────────────────────────────────
+// Frames from this browser always belong to the browser camera ('main')
 export const processFrame = (imageBase64, returnFrame = true) =>
-  api.post('/process_frame', { image: imageBase64, return_frame: returnFrame });
+  api.post('/process_frame', { image: imageBase64, return_frame: returnFrame }, { params: { camera: 'main' } });
+
+// ── Cameras ─────────────────────────────────────────────────────
+export const listCameras = (thumbs = true) => api.get('/cameras', { params: { thumbs } });
+export const addCamera = (name, source) => api.post('/cameras', { name, source });
+export const updateCamera = (id, changes) => api.put(`/cameras/${encodeURIComponent(id)}`, changes);
+export const deleteCamera = (id) => api.delete(`/cameras/${encodeURIComponent(id)}`);
 
 // ── Auth ────────────────────────────────────────────────────────
 export const login = (username, password) => api.post('/auth/login', { username, password });

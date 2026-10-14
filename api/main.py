@@ -10,6 +10,7 @@ import base64
 import json
 import time
 import logging
+import threading
 from datetime import datetime
 from typing import Dict, List, Optional, Any
 from collections import deque
@@ -43,6 +44,8 @@ from lstm_predictor import LSTMCrowdPredictor
 from rl_controller import CrowdControlAgent
 from privacy import PrivacyFilter
 from simulator import CrowdSimulator
+from cameras import (CameraStream, CameraReader, CameraConfig, zones_path_for,
+                     mask_source, BUILTIN)
 from utils import blur_faces, generate_zone_grid
 
 # ─── Logging ──────────────────────────────────────────────────────
@@ -66,57 +69,66 @@ app.add_middleware(
 
 # ─── Global state ────────────────────────────────────────────────
 class SystemState:
+    """The shared models, plus one CameraStream per camera (src/cameras.py)."""
+
     def __init__(self):
+        # Shared models, loaded once
         self.detector: Optional[PeopleDetector] = None
-        self.analyzer: Optional[CrowdAnalyzer] = None
         self.risk_predictor: Optional[RiskPredictor] = None
         self.anomaly_detector: Optional[AnomalyDetector] = None
-        self.tracker: Optional[PersonTracker] = None
         self.lstm_predictor: Optional[LSTMCrowdPredictor] = None
         self.rl_agent: Optional[CrowdControlAgent] = None
         self.privacy_filter: Optional[PrivacyFilter] = None
         self.simulator: Optional[CrowdSimulator] = None
-        self.alert_system: Optional[AlertSystem] = None
-        self.panic_detector: Optional[PanicDetector] = None
-        self.evacuation_detector: Optional[EvacuationDetector] = None
-        self.stream_time = 0.0
-        self.current_panic: Dict = {}
         self.heatmap_gen: Optional[HeatmapGenerator] = None
         self.perf_monitor: Optional[PerformanceMonitor] = None
+        # Settings every camera's tracker and alert system copy
+        self.tracker_template: Optional[PersonTracker] = None
+        self.alert_template: Optional[AlertSystem] = None
 
         self.initialized = False
         self.processing = False
         self.simulation_active = False
+        self.frame_count = 0   # all cameras together
 
-        # Current data
-        self.current_frame: Optional[np.ndarray] = None
-        self.current_detections: List[Dict] = []
-        self.current_tracks: Dict = {}
-        self.current_features: Dict = {}
-        self.current_risk: Dict = {}
-        self.current_anomaly: Dict = {}
-        self.current_alerts: List[Dict] = []
-        self.current_predictions: Dict = {}
-        self.current_suggestions: List[Dict] = []
-        self.current_heatmap: Optional[List] = None
-
-        # History
-        self.frame_count = 0
-        self.history: deque = deque(maxlen=500)
-        self.alert_log: deque = deque(maxlen=200)
-
-        # WebSocket clients
+        # WebSocket clients and the camera each one is watching
         self.ws_clients: List[WebSocket] = []
+        self.ws_watch: Dict[int, str] = {}
+        self.loop: Optional[asyncio.AbstractEventLoop] = None
 
-        # Accounts and login tokens (see src/auth.py)
         data_dir = os.environ.get("CROWDGUARD_DATA_DIR",
                                   os.path.join(os.path.dirname(__file__), '..', 'data'))
+        self.data_dir = data_dir
+        # Accounts and login tokens (see src/auth.py)
         self.users = UserStore(data_dir)
-        # Zones drawn in the dashboard (see src/zones.py)
-        self.zones = ZoneManager(os.path.join(data_dir, 'zones.json'))
-        self.current_zone_stats: List[Dict] = []
         # Telegram / email notifications for critical alerts (see src/notifier.py)
         self.notifier = Notifier(os.path.join(data_dir, 'notify.json'))
+
+        # Cameras (see src/cameras.py). YOLO and the models are shared, so
+        # one frame is analysed at a time.
+        self.camera_config = CameraConfig(os.path.join(data_dir, 'cameras.json'))
+        self.cameras: Dict[str, CameraStream] = {}
+        self.readers: Dict[str, CameraReader] = {}
+        self.pipeline_lock = threading.Lock()
+
+    def camera(self, cam_id: str = 'main') -> CameraStream:
+        """The stream state of a camera (created on first use)."""
+        cam_id = cam_id or 'main'
+        cam = self.cameras.get(cam_id)
+        if cam is not None:
+            return cam
+        if cam_id == 'main':
+            name, kind = 'This browser', 'browser'
+        elif cam_id == 'simulation':
+            name, kind = 'Simulation', 'simulation'
+        else:
+            cfg = self.camera_config.get(cam_id)
+            if cfg is None:
+                raise KeyError(cam_id)
+            name, kind = cfg['name'], 'server'
+        cam = CameraStream(cam_id, name, kind, self, zones_path_for(self.data_dir, cam_id))
+        self.cameras[cam_id] = cam
+        return cam
 
 state = SystemState()
 
@@ -147,16 +159,12 @@ async def startup():
             imgsz=1280
         )
 
-        state.analyzer = CrowdAnalyzer(frame_shape=(480, 640), history_length=60)
-
         # ML models
         state.risk_predictor = RiskPredictor(model_type='random_forest')
         state.anomaly_detector = AnomalyDetector(method='isolation_forest', contamination=0.1)
 
-        # Multi-object tracker
-        state.tracker = PersonTracker(use_deep_sort=True, max_disappeared=30)
-        state.panic_detector = PanicDetector()
-        state.evacuation_detector = EvacuationDetector()
+        # Multi-object tracker (each camera gets its own with these settings)
+        state.tracker_template = PersonTracker(use_deep_sort=True, max_disappeared=30)
 
         # LSTM predictor
         state.lstm_predictor = LSTMCrowdPredictor(window_size=30, prediction_steps=10)
@@ -171,8 +179,8 @@ async def startup():
         # Simulator
         state.simulator = CrowdSimulator(frame_width=640, frame_height=480, fps=15)
 
-        # Alert system
-        state.alert_system = AlertSystem(
+        # Alert system settings (each camera gets its own copy)
+        state.alert_template = AlertSystem(
             risk_threshold=0.7, anomaly_threshold=0.6,
             capacity_limit=30, alert_ratio=0.8, trend_min_slope=0.5
         )
@@ -193,6 +201,15 @@ async def startup():
                 logger.info(f"LSTM predictor trained on synthetic data: {result.get('status')}")
             except Exception as e:
                 logger.warning(f"LSTM training skipped: {e}")
+
+        # Server cameras saved in data/cameras.json, and the loop that analyses them
+        state.loop = asyncio.get_running_loop()
+        for cfg in state.camera_config.cameras:
+            if cfg.get('enabled', True):
+                _start_reader(cfg)
+        threading.Thread(target=_camera_loop, daemon=True, name='camera-loop').start()
+        if state.camera_config.cameras:
+            logger.info(f"Cameras: {', '.join(c['name'] for c in state.camera_config.cameras)}")
 
         state.initialized = True
         logger.info("✓ System initialization complete!")
@@ -281,10 +298,10 @@ async def get_status():
         "ws_clients": len(state.ws_clients),
         "components": {
             "detector": state.detector is not None,
-            "analyzer": state.analyzer is not None,
+            "cameras": len(state.camera_config.cameras),
             "risk_predictor": state.risk_predictor is not None,
             "anomaly_detector": state.anomaly_detector is not None,
-            "tracker": state.tracker is not None,
+            "tracker": state.tracker_template is not None,
             "lstm_predictor": state.lstm_predictor is not None,
             "rl_agent": state.rl_agent is not None,
             "privacy_filter": state.privacy_filter is not None,
@@ -295,144 +312,130 @@ async def get_status():
     }
 
 
+def _cam(camera: str) -> CameraStream:
+    """The camera named in ?camera= (default: this browser's feed)."""
+    try:
+        return state.camera(camera)
+    except KeyError:
+        raise HTTPException(status_code=404, detail=f"No camera '{camera}'")
+
+
 @app.post("/api/process_frame", dependencies=LOGGED_IN)
-async def process_frame(data: FrameInput):
-    """Process a single base64-encoded frame and return full AI analysis."""
+async def process_frame(data: FrameInput, camera: str = 'main'):
+    """Process a single base64-encoded frame from the browser and return the
+    full AI analysis. Only the browser camera ('main') takes frames this way;
+    server cameras are read by the backend itself."""
     if not state.initialized:
         raise HTTPException(status_code=503, detail="System not initialized")
+    if camera in state.readers:
+        raise HTTPException(status_code=400, detail="This camera is read by the server; frames cannot be sent to it")
 
     try:
-        result = _process_frame_internal(data.image)
-
-        # Encode the stored frame (with privacy filter) back to base64
-        # so the frontend can display the processed view
-        if data.return_frame and state.current_frame is not None:
-            display_frame = state.current_frame.copy()
-
-            # Draw detection bounding boxes on the frame
-            for det in result.get('detections', [])[:50]:
-                x1, y1, x2, y2 = det.get('bbox', [0, 0, 0, 0])
-                conf = det.get('confidence', 0)
-                cv2.rectangle(display_frame, (x1, y1), (x2, y2), (0, 255, 0), 2)
-                label = f"{conf:.0%}"
-                cv2.putText(display_frame, label, (x1, y1 - 6),
-                            cv2.FONT_HERSHEY_SIMPLEX, 0.4, (0, 255, 0), 1)
-
-            # Draw people count
-            cv2.putText(display_frame,
-                        f"People: {result.get('people_count', 0)}",
-                        (10, 28), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 255, 255), 2)
-
-            # Draw risk level
-            risk = result.get('risk_prediction', {})
-            rl = risk.get('risk_level', 'low').upper()
-            rc = risk.get('confidence', 0)
-            color = {'LOW': (0, 255, 0), 'MEDIUM': (0, 255, 255), 'HIGH': (0, 0, 255)}.get(rl, (255, 255, 255))
-            cv2.putText(display_frame, f"Risk: {rl} ({rc:.0%})",
-                        (10, 58), cv2.FONT_HERSHEY_SIMPLEX, 0.6, color, 2)
-
-            # Apply privacy filter
-            if state.privacy_filter and state.privacy_filter.enabled:
-                display_frame = state.privacy_filter.blur_faces(display_frame)
-
-            # Apply heatmap overlay
-            heatmap_raw = result.get('heatmap')
-            if heatmap_raw and state.heatmap_gen:
-                hm = np.array(heatmap_raw, dtype=np.uint8)
-                colored = state.heatmap_gen.apply_colormap(hm, display_frame.shape[:2])
-                display_frame = cv2.addWeighted(display_frame, 0.7, colored, 0.3, 0)
-
-            _, buf = cv2.imencode('.jpg', display_frame, [cv2.IMWRITE_JPEG_QUALITY, 70])
-            result['frame_b64'] = base64.b64encode(buf).decode('utf-8')
-
+        result = await asyncio.to_thread(_process_frame_internal, data.image, camera)
+        cam = state.camera(camera)
+        # The processed view (boxes, privacy blur, heatmap) for the dashboard
+        if data.return_frame and cam.current_frame is not None:
+            result['frame_b64'] = base64.b64encode(_annotated_jpeg(cam.current_frame, result)).decode('utf-8')
         result['status'] = 'success'
         return result
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
 
-
 @app.get("/api/current_state", dependencies=LOGGED_IN)
-async def get_current_state():
-    """Get the latest analysis results."""
+async def get_current_state(camera: str = 'main'):
+    """Get the latest analysis results of one camera."""
+    cam = _cam(camera)
     frame_b64 = None
-    if state.current_frame is not None:
+    if cam.last_annotated_jpeg is not None and cam.kind != 'browser':
+        frame_b64 = base64.b64encode(cam.last_annotated_jpeg).decode('utf-8')
+    elif cam.current_frame is not None:
         # Apply privacy filter before sending
-        display_frame = state.current_frame.copy()
+        display_frame = cam.current_frame.copy()
         if state.privacy_filter and state.privacy_filter.enabled:
             display_frame = state.privacy_filter.blur_faces(display_frame)
         _, buf = cv2.imencode('.jpg', display_frame, [cv2.IMWRITE_JPEG_QUALITY, 70])
         frame_b64 = base64.b64encode(buf).decode('utf-8')
 
     return {
+        "camera": cam.id,
         "current_frame": frame_b64,
-        "people_count": len(state.current_detections),
-        "detections": state.current_detections,
-        "tracks": state.current_tracks,
-        "features": state.current_features,
-        "heatmap": state.current_heatmap,
-        "risk_prediction": state.current_risk,
-        "anomaly_detection": state.current_anomaly,
-        "predictions": state.current_predictions,
-        "control_suggestions": state.current_suggestions,
-        "alerts": state.current_alerts,
-        "frame_number": state.frame_count,
+        "people_count": cam.current_count,
+        "detections": cam.current_detections,
+        "tracks": cam.current_tracks,
+        "features": cam.current_features,
+        "heatmap": cam.current_heatmap,
+        "risk_prediction": cam.current_risk,
+        "anomaly_detection": cam.current_anomaly,
+        "predictions": cam.current_predictions,
+        "control_suggestions": cam.current_suggestions,
+        "alerts": cam.current_alerts,
+        "frame_number": cam.frame_count,
         "timestamp": datetime.now().isoformat()
     }
 
 
 @app.get("/api/alerts", dependencies=LOGGED_IN)
-async def get_alerts():
-    """Get current and recent alerts."""
+async def get_alerts(camera: str = 'main'):
+    """Get current and recent alerts of one camera ('all' = every camera)."""
+    if camera == 'all':
+        active = [a for c in state.cameras.values() for a in c.current_alerts]
+        recent = sorted((a for c in state.cameras.values() for a in c.alert_log),
+                        key=lambda a: a.get('timestamp', ''))[-50:]
+    else:
+        cam = _cam(camera)
+        active, recent = cam.current_alerts, list(cam.alert_log)[-20:]
     return {
-        "active_alerts": state.current_alerts,
-        "alert_count": len(state.current_alerts),
-        "recent_history": list(state.alert_log)[-20:],
+        "active_alerts": active,
+        "alert_count": len(active),
+        "recent_history": recent,
         "timestamp": datetime.now().isoformat()
     }
 
 
 @app.get("/api/history", dependencies=LOGGED_IN)
-async def get_history(limit: int = 100):
+async def get_history(limit: int = 100, camera: str = 'main'):
     """Get historical data for charts."""
-    data = list(state.history)[-limit:]
+    cam = _cam(camera)
+    data = list(cam.history)[-limit:]
     return {
         "data": data,
-        "total_records": len(state.history),
+        "total_records": len(cam.history),
         "returned": len(data)
     }
 
 
 @app.get("/api/predictions", dependencies=LOGGED_IN)
-async def get_predictions():
+async def get_predictions(camera: str = 'main'):
     """Get LSTM-based crowd predictions."""
     return {
-        "predictions": state.current_predictions,
+        "predictions": _cam(camera).current_predictions,
         "timestamp": datetime.now().isoformat()
     }
 
 
 @app.get("/api/control_suggestions", dependencies=LOGGED_IN)
-async def get_control_suggestions():
+async def get_control_suggestions(camera: str = 'main'):
     """Get RL-based crowd control suggestions."""
     return {
-        "suggestions": state.current_suggestions,
+        "suggestions": _cam(camera).current_suggestions,
         "timestamp": datetime.now().isoformat()
     }
 
 
 @app.get("/api/zones", dependencies=LOGGED_IN)
-async def get_zones():
+async def get_zones(camera: str = 'main'):
     """Live per-zone counts. Uses the zones drawn in the dashboard, or a
     3x3 grid when none have been drawn yet."""
-    if state.zones.zones:
-        stats = state.current_zone_stats or state.zones.analyze(state.current_detections)
+    cam = _cam(camera)
+    if cam.zones.zones:
+        stats = cam.current_zone_stats or cam.zones.analyze(cam.current_detections)
         return {"zones": stats, "custom": True, "timestamp": datetime.now().isoformat()}
 
     zones = generate_zone_grid((480, 640), rows=3, cols=3)
     for zone in zones:
         zone_dets = [
-            d for d in state.current_detections
+            d for d in cam.current_detections
             if zone['x1'] <= d['center'][0] < zone['x2']
             and zone['y1'] <= d['center'][1] < zone['y2']
         ]
@@ -455,20 +458,142 @@ class ZonesUpdate(BaseModel):
 
 
 @app.get("/api/zones/definitions", dependencies=LOGGED_IN)
-async def get_zone_definitions():
+async def get_zone_definitions(camera: str = 'main'):
     """The saved zone shapes, types and capacities (for the Zone Editor)."""
-    return {"zones": state.zones.zones}
+    return {"zones": _cam(camera).zones.zones}
 
 
 @app.put("/api/zones", dependencies=ADMIN_ONLY)
-async def save_zones(req: ZonesUpdate):
-    """Replace all zones (admin only)."""
+async def save_zones(req: ZonesUpdate, camera: str = 'main'):
+    """Replace all zones of one camera (admin only)."""
+    cam = _cam(camera)
     try:
-        saved = state.zones.set_zones(req.zones)
+        saved = cam.zones.set_zones(req.zones)
     except ValueError as e:
         raise HTTPException(status_code=400, detail=str(e))
-    state.current_zone_stats = state.zones.analyze(state.current_detections)
+    cam.current_zone_stats = cam.zones.analyze(cam.current_detections)
     return {"status": "saved", "zones": saved}
+
+
+# ─── Cameras ─────────────────────────────────────────────────────
+class CameraIn(BaseModel):
+    name: str
+    source: str
+
+
+class CameraUpdate(BaseModel):
+    name: Optional[str] = None
+    source: Optional[str] = None
+    enabled: Optional[bool] = None
+
+
+def _thumb_b64(cam: CameraStream) -> Optional[str]:
+    """A small picture of the camera's latest analysed frame."""
+    try:
+        if cam.last_annotated_jpeg is not None:
+            img = cv2.imdecode(np.frombuffer(cam.last_annotated_jpeg, np.uint8), cv2.IMREAD_COLOR)
+        elif cam.current_frame is not None:
+            img = cam.current_frame
+            if state.privacy_filter and state.privacy_filter.enabled:
+                img = state.privacy_filter.blur_faces(img.copy())
+        else:
+            return None
+        img = cv2.resize(img, (320, 240))
+        ok, buf = cv2.imencode('.jpg', img, [cv2.IMWRITE_JPEG_QUALITY, 60])
+        return base64.b64encode(buf).decode('utf-8') if ok else None
+    except Exception:
+        return None
+
+
+def _camera_info(cam_id: str, admin: bool, thumbs: bool) -> Dict:
+    cfg = state.camera_config.get(cam_id)
+    cam = state.cameras.get(cam_id)
+    if cam is None and cfg is None and cam_id not in BUILTIN:
+        raise KeyError(cam_id)
+    if cam is not None:
+        info = cam.summary()
+    else:
+        name = cfg['name'] if cfg else ('This browser' if cam_id == 'main' else 'Simulation')
+        kind = 'server' if cfg else ('browser' if cam_id == 'main' else 'simulation')
+        info = {"id": cam_id, "name": name, "kind": kind, "people_count": 0, "risk_level": "low",
+                "alert_count": 0, "critical": False, "panic": False, "zones": 0, "frames": 0, "last_update": 0}
+    reader = state.readers.get(cam_id)
+    if cfg is not None:
+        info["enabled"] = cfg.get("enabled", True)
+        info["status"] = reader.status if reader else "off"
+        info["error"] = reader.error if reader else ""
+        info["source_fps"] = round(reader.fps, 1) if reader else 0
+        if admin:
+            info["source"] = mask_source(cfg["source"])
+    else:
+        recent = time.time() - info["last_update"] < 5
+        if cam_id == 'simulation':
+            info["status"] = "live" if state.simulation_active else "off"
+        else:
+            info["status"] = "live" if recent else "idle"
+    if thumbs and cam is not None:
+        info["thumbnail"] = _thumb_b64(cam)
+    return info
+
+
+@app.get("/api/cameras")
+async def list_cameras(thumbs: bool = True, user: Dict = Depends(current_user)):
+    """Every camera with its latest count, risk, alerts and a thumbnail."""
+    admin = user.get("role") == "admin"
+    ids = ['main'] + [c['id'] for c in state.camera_config.cameras]
+    if state.simulation_active or 'simulation' in state.cameras:
+        ids.append('simulation')
+    return {"cameras": [_camera_info(i, admin, thumbs) for i in ids],
+            "max_fps_per_camera": CAMERA_MAX_FPS}
+
+
+@app.post("/api/cameras", dependencies=ADMIN_ONLY)
+async def add_camera(req: CameraIn):
+    """Add a camera the server reads itself: a webcam number (0, 1, ...),
+    an rtsp:// or http:// stream, or a video file path."""
+    try:
+        cfg = state.camera_config.add(req.name, req.source)
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+    _start_reader(cfg)
+    logger.info(f"Camera added: {cfg['name']} ({mask_source(cfg['source'])})")
+    return _camera_info(cfg['id'], True, False)
+
+
+@app.put("/api/cameras/{cam_id}", dependencies=ADMIN_ONLY)
+async def update_camera(cam_id: str, req: CameraUpdate):
+    """Rename a camera, change its source, or turn it on or off."""
+    try:
+        before = dict(state.camera_config.get(cam_id) or {})
+        cfg = state.camera_config.update(cam_id, req.dict(exclude_none=True))
+    except KeyError:
+        raise HTTPException(status_code=404, detail=f"No camera '{cam_id}'")
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+    if cam_id in state.cameras:
+        state.cameras[cam_id].name = cfg['name']
+    if not cfg.get('enabled', True):
+        _stop_reader(cam_id)
+    elif cfg['source'] != before.get('source') or cam_id not in state.readers:
+        _start_reader(cfg)
+        if cam_id in state.cameras:
+            state.cameras[cam_id].reset('camera')
+    return _camera_info(cam_id, True, False)
+
+
+@app.delete("/api/cameras/{cam_id}", dependencies=ADMIN_ONLY)
+async def delete_camera(cam_id: str):
+    """Remove a server camera (its zones file is kept)."""
+    if cam_id in BUILTIN:
+        raise HTTPException(status_code=400, detail="This camera is built in and cannot be removed")
+    try:
+        state.camera_config.remove(cam_id)
+    except KeyError:
+        raise HTTPException(status_code=404, detail=f"No camera '{cam_id}'")
+    _stop_reader(cam_id)
+    with state.pipeline_lock:
+        state.cameras.pop(cam_id, None)
+    return {"status": "deleted", "id": cam_id}
 
 
 @app.get("/api/scenarios", dependencies=LOGGED_IN)
@@ -498,7 +623,7 @@ async def start_simulation(req: SimulationRequest):
 
     # Start from a clean history so the previous video/scenario doesn't
     # leak into this one's trend features, alerts and forecasts.
-    _reset_stream_state('simulation')
+    _reset_stream_state('simulation', 'simulation')
 
     state.simulation_active = True
     config = state.simulator.start_scenario(req.scenario)
@@ -634,7 +759,10 @@ async def train_lstm(req: TrainRequest):
     if not state.lstm_predictor:
         raise HTTPException(status_code=503, detail="LSTM predictor not available")
 
-    result = state.lstm_predictor.train(epochs=req.epochs, n_scenarios=req.n_scenarios)
+    result = await asyncio.to_thread(state.lstm_predictor.train, epochs=req.epochs, n_scenarios=req.n_scenarios)
+    with state.pipeline_lock:
+        for cam in state.cameras.values():
+            cam.refresh_models()
     return {"status": "trained", "result": result}
 
 
@@ -662,10 +790,16 @@ async def toggle_privacy(enabled: Optional[bool] = None):
 
 @app.get("/api/logs/download", dependencies=ADMIN_ONLY)
 async def download_logs():
-    """Download system logs as JSON."""
+    """Download system logs as JSON (every camera)."""
     log_data = {
-        "alert_history": list(state.alert_log),
-        "analysis_history": list(state.history)[-200:],
+        "cameras": {
+            cam.id: {
+                "name": cam.name,
+                "alert_history": list(cam.alert_log),
+                "analysis_history": list(cam.history)[-200:],
+                "frames": cam.frame_count,
+            } for cam in state.cameras.values()
+        },
         "system_info": {
             "total_frames": state.frame_count,
             "timestamp": datetime.now().isoformat()
@@ -714,9 +848,15 @@ async def websocket_endpoint(ws: WebSocket):
                 if msg.get("type") == "ping":
                     await ws.send_json({"type": "pong"})
 
+                elif msg.get("type") == "watch":
+                    # Which camera this dashboard shows (live frames are only
+                    # sent for that one)
+                    state.ws_watch[id(ws)] = str(msg.get("camera") or "main")
+
                 elif msg.get("type") == "frame":
                     # Client sending a frame for processing
-                    result = _process_frame_internal(msg["image"])
+                    result = await asyncio.to_thread(_process_frame_internal, msg["image"],
+                                                     str(msg.get("camera") or "main"))
                     await ws.send_json({"type": "result", "data": result})
 
             except asyncio.TimeoutError:
@@ -730,23 +870,29 @@ async def websocket_endpoint(ws: WebSocket):
     finally:
         if ws in state.ws_clients:
             state.ws_clients.remove(ws)
+        state.ws_watch.pop(id(ws), None)
         logger.info(f"WebSocket client disconnected ({len(state.ws_clients)} remaining)")
 
 
-async def broadcast_ws(data: dict):
-    """Send data to all connected WebSocket clients."""
+async def broadcast_ws(data: dict, camera: Optional[str] = None):
+    """Send data to all connected WebSocket clients (or only to the ones
+    watching `camera`)."""
     disconnected = []
-    for ws in state.ws_clients:
+    for ws in list(state.ws_clients):
+        if camera is not None and state.ws_watch.get(id(ws), 'main') != camera:
+            continue
         try:
             await ws.send_json(data)
         except Exception:
             disconnected.append(ws)
     for ws in disconnected:
-        state.ws_clients.remove(ws)
+        if ws in state.ws_clients:
+            state.ws_clients.remove(ws)
+        state.ws_watch.pop(id(ws), None)
 
 
 # ─── Frame Processing Core ──────────────────────────────────────
-def _snapshot_jpeg(frame: np.ndarray, detections: List[Dict], count: int) -> Optional[bytes]:
+def _snapshot_jpeg(cam: CameraStream, frame: np.ndarray, detections: List[Dict], count: int) -> Optional[bytes]:
     """Camera frame with people boxed, for notifications. Faces are blurred
     when the privacy filter is on."""
     try:
@@ -756,11 +902,11 @@ def _snapshot_jpeg(frame: np.ndarray, detections: List[Dict], count: int) -> Opt
         for d in detections[:200]:
             x1, y1, x2, y2 = [int(v) for v in d['bbox']]
             cv2.rectangle(img, (x1, y1), (x2, y2), (0, 0, 255), 2)
-        for z in state.current_zone_stats:
+        for z in cam.current_zone_stats:
             pts = np.array(z['points'], dtype=np.int32).reshape(-1, 1, 2)
             cv2.polylines(img, [pts], True, (0, 200, 255), 2)
         cv2.rectangle(img, (0, 0), (img.shape[1], 34), (0, 0, 0), -1)
-        cv2.putText(img, f"{count} people  {datetime.now():%H:%M:%S}", (10, 24),
+        cv2.putText(img, f"{cam.name}: {count} people  {datetime.now():%H:%M:%S}", (10, 24),
                     cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 255, 255), 2)
         ok, buf = cv2.imencode('.jpg', img, [cv2.IMWRITE_JPEG_QUALITY, 80])
         return buf.tobytes() if ok else None
@@ -769,34 +915,48 @@ def _snapshot_jpeg(frame: np.ndarray, detections: List[Dict], count: int) -> Opt
         return None
 
 
-def _reset_stream_state(source: str):
-    """
-    Forget all per-stream history: trends, tracks, motion baseline, forecast
-    window, count smoothing. Called when a simulation starts and whenever the
-    input switches between simulation and camera/video, because e.g. the
-    panic detector's idea of "normal speed" from drawn simulation people
-    makes real shoppers look like they are running.
-    """
-    state.analyzer.reset()
-    if state.tracker is not None:
-        state.tracker = PersonTracker(use_deep_sort=state.tracker.use_deep_sort, max_disappeared=30)
-    if state.panic_detector is not None:
-        state.panic_detector.reset()
-    if state.evacuation_detector is not None:
-        state.evacuation_detector.reset()
-    state.stream_time = 0.0
-    if state.lstm_predictor is not None:
-        state.lstm_predictor._history.clear()
-    cc = getattr(state.detector, 'count_corrector', None) if state.detector else None
-    if cc is not None and hasattr(cc, 'reset'):
-        cc.reset()
-    state.stream_source = source
+def _annotated_jpeg(frame: np.ndarray, result: Dict, quality: int = 70) -> bytes:
+    """The frame with boxes, count and risk drawn on it, privacy filter and
+    heatmap applied: what the dashboard shows."""
+    display_frame = frame.copy()
+    if state.privacy_filter and state.privacy_filter.enabled:
+        display_frame = state.privacy_filter.blur_faces(display_frame)
+    for det in result.get('detections', [])[:50]:
+        x1, y1, x2, y2 = [int(v) for v in det.get('bbox', [0, 0, 0, 0])]
+        conf = det.get('confidence', 0)
+        cv2.rectangle(display_frame, (x1, y1), (x2, y2), (0, 255, 0), 2)
+        cv2.putText(display_frame, f"{conf:.0%}", (x1, y1 - 6),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.4, (0, 255, 0), 1)
+    cv2.putText(display_frame, f"People: {result.get('people_count', 0)}",
+                (10, 28), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 255, 255), 2)
+    risk = result.get('risk_prediction', {})
+    rl = risk.get('risk_level', 'low').upper()
+    rc = risk.get('confidence', 0)
+    color = {'LOW': (0, 255, 0), 'MEDIUM': (0, 255, 255), 'HIGH': (0, 0, 255)}.get(rl, (255, 255, 255))
+    cv2.putText(display_frame, f"Risk: {rl} ({rc:.0%})",
+                (10, 58), cv2.FONT_HERSHEY_SIMPLEX, 0.6, color, 2)
+    heatmap_raw = result.get('heatmap')
+    if heatmap_raw and state.heatmap_gen:
+        hm = np.array(heatmap_raw, dtype=np.uint8)
+        colored = state.heatmap_gen.apply_colormap(hm, display_frame.shape[:2])
+        display_frame = cv2.addWeighted(display_frame, 0.7, colored, 0.3, 0)
+    _, buf = cv2.imencode('.jpg', display_frame, [cv2.IMWRITE_JPEG_QUALITY, quality])
+    return buf.tobytes()
 
-def _process_frame_internal(image_b64: str) -> Dict:
-    """Core frame processing pipeline."""
-    start = time.time()
 
-    # Decode image
+def _reset_stream_state(source: str, cam_id: str = 'main'):
+    """
+    Forget one camera's stream history: trends, tracks, motion baseline,
+    forecast window, count smoothing. Called when a simulation starts and
+    whenever a camera's input switches between simulation and video,
+    because e.g. the panic detector's idea of "normal speed" from drawn
+    simulation people makes real shoppers look like they are running.
+    """
+    state.camera(cam_id).reset(source)
+
+
+def _process_frame_internal(image_b64: str, cam_id: str = 'main') -> Dict:
+    """Decode a base64 frame from the browser and run the pipeline."""
     img_bytes = base64.b64decode(image_b64)
     nparr = np.frombuffer(img_bytes, np.uint8)
     frame = cv2.imdecode(nparr, cv2.IMREAD_COLOR)
@@ -806,56 +966,59 @@ def _process_frame_internal(image_b64: str) -> Dict:
     if frame.shape[:2] != (480, 640):
         frame = cv2.resize(frame, (640, 480))
 
-    return _process_raw_frame(frame)
+    return _process_raw_frame(frame, cam=state.camera(cam_id))
 
 
-def _process_raw_frame(frame: np.ndarray, sim_detections=None, frames_elapsed: float = 1.0) -> Dict:
-    """Process a raw numpy frame through the full pipeline."""
+def _process_raw_frame(frame: np.ndarray, sim_detections=None, frames_elapsed: float = 1.0,
+                       cam: Optional[CameraStream] = None) -> Dict:
+    """Run one frame of one camera through the full pipeline. The shared
+    models handle one frame at a time, so this holds the pipeline lock."""
+    with state.pipeline_lock:
+        return _process_locked(frame, sim_detections, frames_elapsed,
+                               cam if cam is not None else state.camera('main'))
+
+
+def _process_locked(frame: np.ndarray, sim_detections, frames_elapsed: float, cam: CameraStream) -> Dict:
     start = time.time()
     state.frame_count += 1
+    cam.frame_count += 1
 
     source = 'simulation' if sim_detections is not None else 'camera'
-    if getattr(state, 'stream_source', None) != source:
-        _reset_stream_state(source)
+    if cam.stream_source != source:
+        cam.reset(source)
 
-    # 1. Detect people
+    # 1. Detect people (with this camera's own count smoothing)
     if sim_detections is not None:
         detections = sim_detections
         count = len(detections)
     else:
+        state.detector.count_corrector = cam.count_corrector
         detections, count = state.detector.detect_people(frame)
 
     # 2. Track people
-    tracks = {}
-    tracking_summary = {}
-    if state.tracker:
-        tracks = state.tracker.update(detections, frame=frame)
-        tracking_summary = state.tracker.get_tracking_summary()
+    tracks = cam.tracker.update(detections, frame=frame)
+    tracking_summary = cam.tracker.get_tracking_summary()
 
     # 2b. Panic detection from movement (works for camera, video and simulation)
-    panic = {}
-    if state.panic_detector is not None and state.tracker:
-        panic = state.panic_detector.update(tracks, frames_elapsed=frames_elapsed)
-    state.current_panic = panic
+    panic = cam.panic_detector.update(tracks, frames_elapsed=frames_elapsed)
+    cam.current_panic = panic
 
     # 2c. Evacuation detection from the count. Time in seconds: simulation
     # time for simulations, wall clock for a camera or video.
     if sim_detections is not None:
         sim_fps = getattr(state.simulator, 'fps', 15) or 15
-        state.stream_time += frames_elapsed / sim_fps
-        t_now = state.stream_time
+        cam.stream_time += frames_elapsed / sim_fps
+        t_now = cam.stream_time
     else:
         t_now = time.time()
-    evacuation = {}
-    if state.evacuation_detector is not None:
-        evacuation = state.evacuation_detector.update(count, t_now)
+    evacuation = cam.evacuation_detector.update(count, t_now)
 
-    # 2d. Per-zone counts for the zones drawn in the dashboard
-    zone_stats = state.zones.analyze(detections, total_count=count)
-    state.current_zone_stats = zone_stats
+    # 2d. Per-zone counts for the zones drawn for this camera
+    zone_stats = cam.zones.analyze(detections, total_count=count)
+    cam.current_zone_stats = zone_stats
 
     # 3. Analyze crowd features (count may be calibrated by the count corrector)
-    features = state.analyzer.update_frame(frame, detections, people_count=count)
+    features = cam.analyzer.update_frame(frame, detections, people_count=count)
 
     # 4. Generate heatmap
     heatmap = None
@@ -872,7 +1035,7 @@ def _process_raw_frame(frame: np.ndarray, sim_detections=None, frames_elapsed: f
     # 5. Risk prediction
     risk_result = {}
     if real_camera and state.risk_predictor and state.risk_predictor.is_trained:
-        fv = state.analyzer.get_feature_vector(state.risk_predictor.feature_names)
+        fv = cam.analyzer.get_feature_vector(state.risk_predictor.feature_names)
         if len(fv) > 0:
             risk_level, confidence = state.risk_predictor.predict(fv)
             risk_result = {'risk_level': risk_level, 'confidence': float(confidence)}
@@ -881,9 +1044,9 @@ def _process_raw_frame(frame: np.ndarray, sim_detections=None, frames_elapsed: f
     anomaly_result = {}
     # Skip the first frames: trend features need history, and an empty
     # history looks "anomalous" to a model trained on a running video.
-    warmed_up = len(state.analyzer.count_history) >= 10
+    warmed_up = len(cam.analyzer.count_history) >= 10
     if real_camera and state.anomaly_detector and state.anomaly_detector.is_trained and warmed_up:
-        fv = state.analyzer.get_feature_vector(state.anomaly_detector.feature_names)
+        fv = cam.analyzer.get_feature_vector(state.anomaly_detector.feature_names)
         if len(fv) > 0:
             is_anomaly, score, details = state.anomaly_detector.detect_anomaly(fv)
             anomaly_result = {
@@ -893,12 +1056,12 @@ def _process_raw_frame(frame: np.ndarray, sim_detections=None, frames_elapsed: f
 
     # 7. LSTM predictions
     predictions = {}
-    if state.lstm_predictor:
+    if cam.lstm_predictor:
         density = features.get('density_per_frame', 0)
         avg_speed = features.get('avg_magnitude', 0)
         flow_mag = features.get('movement_concentration', 0)
-        state.lstm_predictor.add_observation(count, density, avg_speed, flow_mag)
-        predictions = state.lstm_predictor.predict()
+        cam.lstm_predictor.add_observation(count, density, avg_speed, flow_mag)
+        predictions = cam.lstm_predictor.predict()
 
     # 8. RL control suggestions
     suggestions = []
@@ -916,8 +1079,8 @@ def _process_raw_frame(frame: np.ndarray, sim_detections=None, frames_elapsed: f
     # Aligned with the capacity alerts so the dashboard badge and the
     # warnings always agree (medium >= 80% capacity, high > capacity).
     if not risk_result:
-        cap = state.alert_system.capacity_limit if state.alert_system else 30
-        ratio = state.alert_system.alert_ratio if state.alert_system else 0.8
+        cap = cam.alert_system.capacity_limit
+        ratio = cam.alert_system.alert_ratio
         if count > cap:
             risk_result = {'risk_level': 'high', 'confidence': 0.9}
         elif count >= cap * ratio:
@@ -937,21 +1100,20 @@ def _process_raw_frame(frame: np.ndarray, sim_detections=None, frames_elapsed: f
                        'reason': 'panic'}
 
     # 9. Generate alerts
-    alerts = []
-    if state.alert_system:
-        raw_alerts = state.alert_system.evaluate_risk(risk_result, anomaly_result, {**features, 'panic': panic, 'evacuation': evacuation})
-        raw_alerts += zone_alerts(zone_stats, time.time())
-        # Copy before making serializable: AlertSystem keeps the originals in
-        # active_alerts and later does `now - alert['timestamp']`, which
-        # crashed with "float - str" once the timestamp became a string.
-        alerts = [{**a, 'timestamp': datetime.now().isoformat()} for a in raw_alerts]
-        state.alert_log.extend(alerts)
+    raw_alerts = cam.alert_system.evaluate_risk(risk_result, anomaly_result, {**features, 'panic': panic, 'evacuation': evacuation})
+    raw_alerts += zone_alerts(zone_stats, time.time())
+    # Copy before making serializable: AlertSystem keeps the originals in
+    # active_alerts and later does `now - alert['timestamp']`, which
+    # crashed with "float - str" once the timestamp became a string.
+    alerts = [{**a, 'timestamp': datetime.now().isoformat(), 'camera': cam.id, 'camera_name': cam.name}
+              for a in raw_alerts]
+    cam.alert_log.extend(alerts)
 
-        # Phone / email notifications (cooldown per alert kind, sent in background)
-        to_send = state.notifier.wants(alerts)
-        if to_send:
-            state.notifier.notify(to_send, _snapshot_jpeg(frame, detections, count),
-                                  context='simulation' if sim_detections is not None else 'live camera')
+    # Phone / email notifications (cooldown per alert kind and camera, sent in background)
+    to_send = state.notifier.wants(alerts)
+    if to_send:
+        kind = 'simulation' if sim_detections is not None else 'live camera'
+        state.notifier.notify(to_send, _snapshot_jpeg(cam, frame, detections, count), context=kind)
 
     proc_time = time.time() - start
     fps = 1.0 / proc_time if proc_time > 0 else 0
@@ -971,21 +1133,23 @@ def _process_raw_frame(frame: np.ndarray, sim_detections=None, frames_elapsed: f
         else:
             safe_features[k] = v
 
-    # Update global state
-    state.current_frame = frame
-    state.current_detections = detections
-    state.current_tracks = {str(k): v for k, v in tracks.items()}
-    state.current_features = safe_features
-    state.current_risk = risk_result
-    state.current_anomaly = anomaly_result
-    state.current_predictions = predictions
-    state.current_suggestions = suggestions
-    state.current_alerts = alerts
-    state.current_heatmap = heatmap
+    # Update this camera's state
+    cam.current_frame = frame
+    cam.current_count = count
+    cam.current_detections = detections
+    cam.current_tracks = {str(k): v for k, v in tracks.items()}
+    cam.current_features = safe_features
+    cam.current_risk = risk_result
+    cam.current_anomaly = anomaly_result
+    cam.current_predictions = predictions
+    cam.current_suggestions = suggestions
+    cam.current_alerts = alerts
+    cam.current_heatmap = heatmap
+    cam.last_update = time.time()
 
     # Add to history
     history_entry = {
-        'frame': state.frame_count,
+        'frame': cam.frame_count,
         'timestamp': datetime.now().isoformat(),
         'people_count': count,
         'density': safe_features.get('density_per_frame', 0),
@@ -996,10 +1160,12 @@ def _process_raw_frame(frame: np.ndarray, sim_detections=None, frames_elapsed: f
         'alert_count': len(alerts),
         'fps': round(fps, 1)
     }
-    state.history.append(history_entry)
+    cam.history.append(history_entry)
 
     result = {
-        'frame_number': state.frame_count,
+        'camera': cam.id,
+        'camera_name': cam.name,
+        'frame_number': cam.frame_count,
         'people_count': count,
         'detections': detections[:50],  # Cap for bandwidth
         'tracks': {str(k): v for k, v in list(tracks.items())[:50]},
@@ -1025,13 +1191,72 @@ def _process_raw_frame(frame: np.ndarray, sim_detections=None, frames_elapsed: f
     return result
 
 
+# ─── Server cameras ──────────────────────────────────────────────
+CAMERA_MAX_FPS = float(os.environ.get("CROWDGUARD_CAMERA_FPS", "5"))   # analysed frames per camera per second
+
+
+def _start_reader(cfg: Dict):
+    old = state.readers.pop(cfg['id'], None)
+    if old is not None:
+        old.stop()
+    state.readers[cfg['id']] = CameraReader(cfg['id'], cfg['source'])
+
+
+def _stop_reader(cam_id: str):
+    reader = state.readers.pop(cam_id, None)
+    if reader is not None:
+        reader.stop()
+
+
+def _camera_loop():
+    """
+    Background thread: analyse the newest frame of each server camera in
+    turn, fairly (the camera waiting longest goes first), at most
+    CAMERA_MAX_FPS frames per camera per second. Results go to the
+    dashboards watching that camera over the WebSocket.
+    """
+    last_seq: Dict[str, int] = {}
+    last_done: Dict[str, float] = {}
+    while True:
+        try:
+            now = time.time()
+            ready = []
+            for cam_id, reader in list(state.readers.items()):
+                seq, frame = reader.latest()
+                if frame is None or seq == last_seq.get(cam_id):
+                    continue
+                if now - last_done.get(cam_id, 0) < 1.0 / CAMERA_MAX_FPS:
+                    continue
+                ready.append((last_done.get(cam_id, 0), cam_id, seq, frame))
+            if not ready or not state.initialized:
+                time.sleep(0.02)
+                continue
+            _, cam_id, seq, frame = min(ready, key=lambda r: r[0])
+            last_seq[cam_id], last_done[cam_id] = seq, time.time()
+            try:
+                cam = state.camera(cam_id)
+            except KeyError:
+                continue
+            result = _process_raw_frame(frame, cam=cam)
+            jpeg = _annotated_jpeg(frame, result)
+            cam.last_annotated_jpeg = jpeg
+            if any(w == cam_id for w in state.ws_watch.values()) and state.loop is not None:
+                result['frame_b64'] = base64.b64encode(jpeg).decode('utf-8')
+                asyncio.run_coroutine_threadsafe(
+                    broadcast_ws({"type": "camera_frame", "camera": cam_id, "data": result}, camera=cam_id),
+                    state.loop)
+        except Exception as e:
+            logger.error(f"Camera loop error: {e}", exc_info=True)
+            time.sleep(0.5)
+
+
 # ─── Simulation Runner ───────────────────────────────────────────
 async def _run_simulation():
     """Run simulation in background and broadcast results via WebSocket."""
     logger.info("Simulation background task started")
-    import time
     target_fps = 15
     last_time = time.time()
+    cam = state.camera('simulation')
 
     while state.simulation_active and state.simulator and state.simulator.is_running:
         current_time = time.time()
@@ -1045,9 +1270,10 @@ async def _run_simulation():
 
         frame = data.get('frame')
         if frame is not None:
-            # Process through full pipeline
-            result = _process_raw_frame(frame, sim_detections=data.get('detections'),
-                                        frames_elapsed=steps)
+            # Process through full pipeline (in a thread, so the server
+            # keeps answering while a camera frame is being analysed)
+            result = await asyncio.to_thread(
+                _process_raw_frame, frame, data.get('detections'), steps, cam)
 
             # Add simulation-specific info
             result['simulation'] = {
@@ -1062,6 +1288,7 @@ async def _run_simulation():
             if state.privacy_filter and state.privacy_filter.enabled:
                 display_frame = state.privacy_filter.blur_faces(display_frame)
             _, buf = cv2.imencode('.jpg', display_frame, [cv2.IMWRITE_JPEG_QUALITY, 65])
+            cam.last_annotated_jpeg = buf.tobytes()
             result['frame_b64'] = base64.b64encode(buf).decode('utf-8')
 
             # Broadcast to all WebSocket clients

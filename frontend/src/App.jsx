@@ -21,6 +21,8 @@ import HeatmapPanel from './components/HeatmapPanel';
 import LoginPage from './components/LoginPage';
 import UserManagement from './components/UserManagement';
 import NotificationSettings from './components/NotificationSettings';
+import CamerasPage from './components/CamerasPage';
+import ServerCameraView from './components/ServerCameraView';
 
 // New Feature Components
 import IncidentReport from './components/IncidentReport';
@@ -95,6 +97,16 @@ function App() {
   const [suggestions, setSuggestions] = useState([]);
   const [privacyEnabled, setPrivacyEnabled] = useState(true);
   const [heatmapData, setHeatmapData] = useState(null);
+
+  // ── Camera shown on every page ──────────────────────────────
+  const [selectedCamera, setSelectedCamera] = useState(() => {
+    let id = 'main';
+    try { id = localStorage.getItem('crowdguard-camera') || 'main'; } catch (e) { /* storage unavailable */ }
+    api.setCamera(id);
+    return id;
+  });
+  const selectedCameraRef = useRef(selectedCamera);
+  const [cameraList, setCameraList] = useState([]);
 
   // ── Input source tracking ───────────────────────────────────
   const [inputSource, setInputSource] = useState('none'); // 'none' | 'camera' | 'upload' | 'simulation'
@@ -182,8 +194,21 @@ function App() {
   // WEBSOCKET — for simulation real-time stream
   // ═══════════════════════════════════════════════════════════════
   const handleWsMessage = useCallback((msg) => {
+    if (msg.type === 'camera_frame' && msg.data) {
+      // A camera the server reads itself (only sent for the one we watch)
+      if (msg.camera === selectedCameraRef.current) {
+        setOverlay({ capturedAt: performance.now() });
+        applyFrameResult(msg.data, msg.data.frame_b64);
+      }
+      return;
+    }
     if (msg.type === 'simulation_frame' && msg.data) {
       const d = msg.data;
+      if (selectedCameraRef.current !== 'simulation') {
+        // Another camera is on screen: only keep the progress bar current
+        if (d.simulation) setSimProgress(d.simulation.progress || 0);
+        return;
+      }
 
       // When simulation starts, mark source
       if (inputSource !== 'simulation') setInputSource('simulation');
@@ -204,7 +229,31 @@ function App() {
     }
   }, [applyFrameResult, inputSource]);
 
-  const { isConnected } = useWebSocket(handleWsMessage);
+  const { isConnected, sendMessage } = useWebSocket(handleWsMessage);
+
+  // Tell the server which camera's live frames to send us
+  useEffect(() => {
+    if (isConnected) sendMessage({ type: 'watch', camera: selectedCamera });
+  }, [isConnected, selectedCamera, sendMessage]);
+
+  // Switch every page to another camera
+  const switchCamera = useCallback((id) => {
+    id = id || 'main';
+    if (id === selectedCameraRef.current) return;
+    api.setCamera(id);
+    selectedCameraRef.current = id;
+    try { localStorage.setItem('crowdguard-camera', id); } catch (e) { /* storage unavailable */ }
+    setCurrentState(null);
+    setAlerts([]);
+    setAlertHistory([]);
+    setHistory([]);
+    setZones([]);
+    setZoneDefs([]);
+    setPredictions({});
+    setSuggestions([]);
+    setHeatmapData(null);
+    setSelectedCamera(id);
+  }, []);
 
   // ═══════════════════════════════════════════════════════════════
   // POLLING — fetches system state & zones periodically
@@ -214,12 +263,21 @@ function App() {
 
     const fetchStatus = async () => {
       try {
-        const [statusRes, zoneRes] = await Promise.allSettled([
+        const [statusRes, zoneRes, camRes] = await Promise.allSettled([
           api.getStatus(),
           api.getZones(),
+          api.listCameras(false),
         ]);
         if (statusRes.status === 'fulfilled') setSystemStatus(statusRes.value.data);
         if (zoneRes.status === 'fulfilled') setZones(zoneRes.value.data.zones || []);
+        if (camRes.status === 'fulfilled') {
+          const list = camRes.value.data.cameras || [];
+          setCameraList(list);
+          // The camera we were showing was removed: back to this browser
+          if (!list.some((c) => c.id === selectedCameraRef.current) && selectedCameraRef.current !== 'simulation') {
+            switchCamera('main');
+          }
+        }
       } catch (e) {
         console.error('Polling error:', e);
       }
@@ -256,7 +314,7 @@ function App() {
     // Poll status + zones at a slower rate (these don't need per-frame update)
     const interval = setInterval(fetchStatus, 5000);
     return () => clearInterval(interval);
-  }, [isLoggedIn]);
+  }, [isLoggedIn, selectedCamera, switchCamera]);
 
   // ═══════════════════════════════════════════════════════════════
   // HANDLERS
@@ -275,7 +333,7 @@ function App() {
   useEffect(() => {
     if (!isLoggedIn || activePage !== 'zones') return;
     api.getZoneDefinitions().then((r) => setZoneDefs(r.data.zones || [])).catch(() => {});
-  }, [isLoggedIn, activePage]);
+  }, [isLoggedIn, activePage, selectedCamera]);
 
   const handleSaveZones = async (list) => {
     const res = await api.saveZones(list);
@@ -306,6 +364,7 @@ function App() {
   const handleStartSim = async (scenario) => {
     try {
       await api.startSimulation(scenario);
+      switchCamera('simulation');
       setSimRunning(true);
       setSimProgress(0);
       setInputSource('simulation');
@@ -368,6 +427,19 @@ function App() {
     riskLevel: currentState?.risk_prediction?.risk_level || 'low',
   };
 
+  // A camera the server reads shows its analysed frames; the browser camera
+  // and the simulation use the normal video panel
+  const cameraInfo = cameraList.find((c) => c.id === selectedCamera)
+    || { id: selectedCamera, name: selectedCamera === 'main' ? 'This browser' : selectedCamera === 'simulation' ? 'Simulation' : selectedCamera,
+         kind: selectedCamera === 'main' ? 'browser' : selectedCamera === 'simulation' ? 'simulation' : 'server' };
+  const feed = cameraInfo.kind === 'server' ? (
+    <ServerCameraView camera={cameraInfo} frameData={frameData} peopleCount={peopleCount}
+                      riskLevel={riskLevel} isConnected={isConnected} />
+  ) : (
+    <VideoFeed {...videoFeedProps} />
+  );
+  const pickerList = cameraList.some((c) => c.id === selectedCamera) ? cameraList : [...cameraList, cameraInfo];
+
   // ── Main Dashboard ───────────────────────────────────────────
   return (
     <div className="min-h-screen bg-grid" style={{ backgroundColor: 'var(--color-bg)' }}>
@@ -389,10 +461,25 @@ function App() {
           <div>
             <h2 className="text-xl font-bold t-heading capitalize">{activePage.replace('_', ' ')}</h2>
             <p className="text-xs t-muted mt-0.5">
-              Real-time AI-powered crowd monitoring • {inputSource !== 'none' ? `Source: ${inputSource}` : 'No input active'}
+              Real-time AI-powered crowd monitoring • {cameraInfo.kind === 'server' ? `Camera: ${cameraInfo.name}`
+                : inputSource !== 'none' ? `Source: ${inputSource}` : 'No input active'}
             </p>
           </div>
           <div className="flex items-center gap-3">
+            {/* Camera picker: every page shows this camera */}
+            <select
+              className="input-field !py-1.5 !text-xs max-w-[11rem]"
+              value={selectedCamera}
+              onChange={(e) => switchCamera(e.target.value)}
+              title="Camera shown on every page"
+              id="camera-picker"
+            >
+              {pickerList.map((c) => (
+                <option key={c.id} value={c.id}>
+                  {c.name}{c.alert_count > 0 ? ` (${c.alert_count} alert${c.alert_count > 1 ? 's' : ''})` : ''}
+                </option>
+              ))}
+            </select>
             {/* New Features: Emergency Panel and Incident Report */}
             <EmergencyPanel 
               currentState={currentState} 
@@ -457,6 +544,15 @@ function App() {
           </div>
         </header>
 
+        {/* ============ CAMERAS ============ */}
+        {activePage === 'cameras' && (
+          <CamerasPage
+            selectedCamera={selectedCamera}
+            isAdmin={currentUser && currentUser.role === 'admin'}
+            onOpenCamera={(cam, go) => { switchCamera(cam.id); if (go) setActivePage('dashboard'); }}
+          />
+        )}
+
         {/* ============ DASHBOARD ============ */}
         {activePage === 'dashboard' && (
           <div className="space-y-6 animate-fade-in">
@@ -497,7 +593,7 @@ function App() {
             {/* Video + Risk + Alerts */}
             <div className="grid grid-cols-1 lg:grid-cols-3 gap-4">
               <div className="lg:col-span-2 relative group">
-                <VideoFeed {...videoFeedProps} />
+                {feed}
                 <button 
                   onClick={() => setActivePage('video')} 
                   className="absolute top-4 right-4 p-2 rounded-xl bg-black/40 hover:bg-brand-500 text-white backdrop-blur-md opacity-0 group-hover:opacity-100 transition-all z-10 hover:scale-110 shadow-lg"
@@ -632,7 +728,7 @@ function App() {
           <div className="animate-fade-in space-y-4">
             <div className="grid grid-cols-1 lg:grid-cols-3 gap-4">
               <div className="lg:col-span-2">
-                <VideoFeed {...videoFeedProps} />
+                {feed}
               </div>
               <div className="space-y-4">
                 <RiskGauge riskLevel={riskLevel} confidence={riskConf} />

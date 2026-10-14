@@ -25,6 +25,7 @@ A production-ready, real-time AI system for crowd detection, risk prediction, be
 | **Audio Alert System** | Web Audio API synthetic tones |
 | **Phone/Email Alerts** | Telegram bot and SMTP email with camera snapshot |
 | **Zones** | Draw named zones with capacities; per-zone counts and alerts |
+| **Multiple Cameras** | Webcams, IP/CCTV (RTSP), phone cameras and video files side by side |
 
 ## 📁 Project Structure
 
@@ -128,7 +129,22 @@ Draw zones over the camera view in **Zone Map → Zone Editor**. As an admin, gi
 | Exit | "Exit 'North exit' is congested", CRITICAL when over capacity |
 | Restricted | CRITICAL as soon as anyone is inside |
 
-People are placed by where their feet are (the bottom of their box), which matches where they stand on the floor. Zone counts are scaled to agree with the corrected total count. Zones are saved in `data/zones.json`. Without any zones the dashboard shows the old 3×3 grid. Tests are in `tests/test_zones.py`.
+People are placed by where their feet are (the bottom of their box), which matches where they stand on the floor. Zone counts are scaled to agree with the corrected total count. Each camera has its own zones (`data/zones.json` for the browser feed, `data/zones_<camera>.json` for the others). Without any zones the dashboard shows the old 3×3 grid. Tests are in `tests/test_zones.py`.
+
+## 📷 Multiple Cameras
+
+Open **Cameras** in the sidebar to see every camera at once: a live thumbnail, the people count, the risk level and any alerts. As an admin, add a camera with a name and a source:
+
+| Source | Example |
+|---|---|
+| Webcam on the backend computer | `0`, `1` |
+| IP / CCTV camera | `rtsp://user:password@192.168.1.20:554/stream1` |
+| Phone (an IP camera app such as "IP Webcam") | `http://192.168.1.5:8080/video` |
+| Video file (loops) | `C:\Users\HP\Videos\mall.mp4` |
+
+The backend reads these cameras itself, so they keep being watched (and alerts keep going to your phone) with no browser open. Each camera has its own counts, tracks, panic and evacuation detection, zones, alerts and forecasts; the models are loaded once and shared. Pick a camera with the picker at the top and every page shows it. The webcam or video you start on **Live Feed** is the camera called "This browser", which works as before.
+
+Each camera is analysed at up to 5 frames a second (`CROWDGUARD_CAMERA_FPS`); with several cameras they share the CPU in turn. Cameras are saved in `data/cameras.json` (git-ignored, since it can hold camera passwords; passwords are hidden in the dashboard). Notifications name the camera, and the cooldown is per camera. Tests are in `tests/test_cameras.py`.
 
 ## 📲 Phone and Email Alerts
 
@@ -219,13 +235,15 @@ docker-compose up --build
 | Method | Endpoint | Description |
 |--------|----------|-------------|
 | GET | `/api/status` | System health & components |
-| GET | `/api/current_state` | Latest analysis results |
+| GET | `/api/current_state` | Latest analysis results (`?camera=<id>` on the camera endpoints, default the browser feed) |
 | POST | `/api/process_frame` | Process base64 frame |
 | GET | `/api/alerts` | Active alerts |
 | GET | `/api/history` | Historical data |
 | GET | `/api/predictions` | LSTM predictions |
 | GET | `/api/control_suggestions` | RL suggestions |
 | GET | `/api/zones` | Zone-based analysis |
+| GET/POST | `/api/cameras` | List cameras (with thumbnails) / add one |
+| PUT/DELETE | `/api/cameras/{id}` | Rename, change source, turn on/off / remove |
 | GET | `/api/scenarios` | Available simulations |
 | POST | `/api/simulate` | Start simulation |
 | POST | `/api/simulate/stop` | Stop simulation |

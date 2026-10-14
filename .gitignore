@@ -11,6 +11,7 @@ training/cache/
 data/users.json
 data/secret.key
 data/notify.json
+data/cameras.json
 
 # OpenVINO exports are generated automatically on first start
 *_openvino_model/

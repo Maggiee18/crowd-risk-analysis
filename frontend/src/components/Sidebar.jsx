@@ -1,11 +1,12 @@
 import React from 'react';
 import {
   Activity, Users, Eye, AlertTriangle, BarChart3,
-  Map, Brain, Shield, Play, Settings, LogOut, Download, Flame
+  Map, Brain, Shield, Play, Settings, LogOut, Download, Flame, Camera
 } from 'lucide-react';
 
 const navItems = [
   { id: 'dashboard', label: 'Dashboard', icon: Activity },
+  { id: 'cameras', label: 'Cameras', icon: Camera },
   { id: 'video', label: 'Live Feed', icon: Eye },
   { id: 'analytics', label: 'Analytics', icon: BarChart3 },
   { id: 'zones', label: 'Zone Map', icon: Map },
