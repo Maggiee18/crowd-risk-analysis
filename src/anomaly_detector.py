@@ -137,17 +137,15 @@ class AnomalyDetector:
         # Scale features
         features_scaled = self.scaler.transform(features)
         
-        # Make prediction
-        prediction = self.model.predict(features_scaled)[0]
-        is_anomaly = prediction == -1
-        
-        # Get anomaly score
+        # Score once; for these models predict() is just decision_function < 0,
+        # so calling both ran every tree twice
         if hasattr(self.model, 'decision_function'):
-            anomaly_score = self.model.decision_function(features_scaled)[0]
-        elif hasattr(self.model, 'score_samples'):
-            anomaly_score = self.model.score_samples(features_scaled)[0]
+            anomaly_score = float(self.model.decision_function(features_scaled)[0])
+            is_anomaly = anomaly_score < 0
         else:
-            anomaly_score = 0.0
+            is_anomaly = self.model.predict(features_scaled)[0] == -1
+            anomaly_score = (float(self.model.score_samples(features_scaled)[0])
+                             if hasattr(self.model, 'score_samples') else 0.0)
         
         # Normalize score to [0, 1] where higher means more anomalous.
         # score_scale (set by training) maps the most anomalous training

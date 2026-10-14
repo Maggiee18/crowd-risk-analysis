@@ -349,16 +349,16 @@ class RiskPredictor:
         # Scale features
         features_scaled = self.scaler.transform(features)
         
-        # Make prediction
-        prediction = self.model.predict(features_scaled)[0]
-        predicted_label = self.label_encoder.inverse_transform([prediction])[0]
-        
-        # Get confidence
+        # Make prediction. One predict_proba call gives both the label and
+        # the confidence (calling predict too ran the whole forest twice).
         if hasattr(self.model, 'predict_proba'):
             probabilities = self.model.predict_proba(features_scaled)[0]
-            confidence = np.max(probabilities)
+            prediction = self.model.classes_[int(np.argmax(probabilities))]
+            confidence = float(np.max(probabilities))
         else:
+            prediction = self.model.predict(features_scaled)[0]
             confidence = 1.0
+        predicted_label = str(self.label_encoder.inverse_transform([prediction])[0])
         
         return predicted_label, confidence
     
@@ -387,6 +387,10 @@ class RiskPredictor:
         self.label_encoder = model_data['label_encoder']
         self.feature_names = model_data['feature_names']
         self.model_type = model_data['model_type']
+        # Predicting one frame at a time: spreading that over all CPU cores
+        # costs more than it saves (149 ms vs 37 ms per frame)
+        if hasattr(self.model, 'n_jobs'):
+            self.model.n_jobs = 1
         self.is_trained = True
         
         self.logger.info(f"Model loaded from {file_path}")

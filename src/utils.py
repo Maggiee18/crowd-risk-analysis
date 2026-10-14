@@ -146,7 +146,8 @@ def create_heatmap(data: np.ndarray, title: str, save_path: str = None) -> None:
     
     plt.show()
 
-def calculate_optical_flow(prev_frame: np.ndarray, curr_frame: np.ndarray) -> Tuple[np.ndarray, np.ndarray]:
+def calculate_optical_flow(prev_frame: np.ndarray, curr_frame: np.ndarray,
+                           scale: float = 0.5) -> Tuple[np.ndarray, np.ndarray]:
     """
     Calculate dense optical flow between consecutive frames using Farneback method.
     
@@ -161,6 +162,14 @@ def calculate_optical_flow(prev_frame: np.ndarray, curr_frame: np.ndarray) -> Tu
     prev_gray = cv2.cvtColor(prev_frame, cv2.COLOR_BGR2GRAY) if len(prev_frame.shape) == 3 else prev_frame
     curr_gray = cv2.cvtColor(curr_frame, cv2.COLOR_BGR2GRAY) if len(curr_frame.shape) == 3 else curr_frame
     
+    # Compute the flow at reduced resolution (4x less work at scale 0.5),
+    # then bring it back to full size with motion in full-size pixels
+    full_hw = curr_gray.shape[:2]
+    if scale != 1.0:
+        size = (max(1, int(full_hw[1] * scale)), max(1, int(full_hw[0] * scale)))
+        prev_gray = cv2.resize(prev_gray, size, interpolation=cv2.INTER_AREA)
+        curr_gray = cv2.resize(curr_gray, size, interpolation=cv2.INTER_AREA)
+
     # Calculate dense optical flow using Farneback method
     flow = cv2.calcOpticalFlowFarneback(
         prev_gray, curr_gray, None,
@@ -170,6 +179,8 @@ def calculate_optical_flow(prev_frame: np.ndarray, curr_frame: np.ndarray) -> Tu
     )
     
     # Calculate magnitude and angle from flow vectors
+    if scale != 1.0:
+        flow = cv2.resize(flow, (full_hw[1], full_hw[0]), interpolation=cv2.INTER_LINEAR) / scale
     magnitude, angle = cv2.cartToPolar(flow[..., 0], flow[..., 1])
     
     return magnitude, angle

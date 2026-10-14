@@ -11,7 +11,8 @@ services:
       - ./output:/app/output
       - ./data:/app/data
     environment:
-      - ADMIN_TOKEN=${ADMIN_TOKEN:-crowd2024admin}
+      # first-start admin password (otherwise one is generated and logged)
+      - CROWDGUARD_ADMIN_PASSWORD=${CROWDGUARD_ADMIN_PASSWORD:-}
       - PYTHONUNBUFFERED=1
     restart: unless-stopped
     healthcheck:

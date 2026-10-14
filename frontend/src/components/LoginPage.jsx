@@ -16,7 +16,8 @@ export default function LoginPage({ onLogin }) {
     try {
       await onLogin(username, password);
     } catch (err) {
-      setError('Invalid credentials. Try admin / admin123');
+      const detail = err && err.response && err.response.data && err.response.data.detail;
+      setError(detail || 'Could not reach the server. Is the backend running?');
     } finally {
       setLoading(false);
     }
@@ -36,7 +37,7 @@ export default function LoginPage({ onLogin }) {
 
         {/* Login card */}
         <div className="glass-card">
-          <h2 className="text-lg font-semibold text-white mb-6">Admin Login</h2>
+          <h2 className="text-lg font-semibold text-white mb-6">Sign In</h2>
 
           <form onSubmit={handleSubmit} className="space-y-4">
             <div>
@@ -92,7 +93,7 @@ export default function LoginPage({ onLogin }) {
           </form>
 
           <p className="text-[10px] text-slate-600 text-center mt-4">
-            Default: admin / admin123
+            First time? The admin password is printed in the backend window when it starts.
           </p>
         </div>
       </div>

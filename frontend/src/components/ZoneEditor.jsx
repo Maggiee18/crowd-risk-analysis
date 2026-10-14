@@ -5,9 +5,42 @@ import { Map, Plus, Trash2, Save, Eye, EyeOff } from 'lucide-react';
  * Feature #6: Geofence / Virtual Zone Editor
  * Interactive canvas for drawing zones over the video feed.
  */
-export default function ZoneEditor({ frameData, frameWidth = 640, frameHeight = 480, onZonesUpdate }) {
+const DEFAULT_CAPACITY = { monitor: 15, entry: 10, exit: 8, restricted: 0 };
+
+export default function ZoneEditor({
+  frameData, frameWidth = 640, frameHeight = 480, onZonesUpdate,
+  initialZones = [], liveStats = [], canEdit = true, onSave,
+}) {
   const canvasRef = useRef(null);
-  const [zones, setZones] = useState([]);
+  const [zones, setZones] = useState(initialZones);
+  const [dirty, setDirty] = useState(false);
+  const [saveMsg, setSaveMsg] = useState(null);
+
+  // Load the saved zones when they arrive from the server
+  useEffect(() => {
+    if (!dirty) setZones(initialZones);
+  }, [initialZones]); // eslint-disable-line react-hooks/exhaustive-deps
+
+  const liveByName = Object.fromEntries((liveStats || []).map((z) => [z.name, z]));
+
+  const updateZone = (i, patch) => {
+    const updated = zones.map((z, idx) => (idx === i ? { ...z, ...patch } : z));
+    setZones(updated);
+    setDirty(true);
+    onZonesUpdate?.(updated);
+  };
+
+  const handleSave = async () => {
+    if (!onSave) return;
+    try {
+      await onSave(zones);
+      setDirty(false);
+      setSaveMsg({ ok: true, text: 'Zones saved. Counts and alerts now use them.' });
+    } catch (e) {
+      const detail = e && e.response && e.response.data && e.response.data.detail;
+      setSaveMsg({ ok: false, text: detail || 'Could not save zones' });
+    }
+  };
   const [drawing, setDrawing] = useState(false);
   const [currentPoints, setCurrentPoints] = useState([]);
   const [selectedZone, setSelectedZone] = useState(null);
@@ -132,14 +165,16 @@ export default function ZoneEditor({ frameData, frameWidth = 640, frameHeight = 
     if (currentPoints.length < 3) return;
 
     const newZone = {
-      id: Date.now(),
-      name: `Zone ${zones.length + 1}`,
+      id: String(Date.now()),
+      name: `${zoneColors[zoneType].label} ${zones.length + 1}`,
       type: zoneType,
       points: currentPoints,
+      capacity: DEFAULT_CAPACITY[zoneType],
     };
 
     const updated = [...zones, newZone];
     setZones(updated);
+    setDirty(true);
     setCurrentPoints([]);
     setDrawing(false);
     onZonesUpdate?.(updated);
@@ -148,6 +183,7 @@ export default function ZoneEditor({ frameData, frameWidth = 640, frameHeight = 
   const deleteZone = useCallback((i) => {
     const updated = zones.filter((_, idx) => idx !== i);
     setZones(updated);
+    setDirty(true);
     setSelectedZone(null);
     onZonesUpdate?.(updated);
   }, [zones, onZonesUpdate]);
@@ -193,7 +229,15 @@ export default function ZoneEditor({ frameData, frameWidth = 640, frameHeight = 
 
         <div className="flex-1" />
 
-        {!drawing ? (
+        {canEdit && dirty && !drawing && (
+          <button onClick={handleSave} className="btn-primary !py-1.5 !px-3 text-[10px]">
+            <Save size={10} /> Save zones
+          </button>
+        )}
+
+        {!canEdit ? (
+          <span className="text-[10px] t-muted">Only admins can edit zones</span>
+        ) : !drawing ? (
           <button
             onClick={() => { setDrawing(true); setCurrentPoints([]); }}
             className="btn-primary !py-1.5 !px-3 text-[10px]"
@@ -234,6 +278,13 @@ export default function ZoneEditor({ frameData, frameWidth = 640, frameHeight = 
         />
       </div>
 
+      {saveMsg && (
+        <p className={`text-[10px] mt-2 ${saveMsg.ok ? 'text-emerald-400' : 'text-red-400'}`}>{saveMsg.text}</p>
+      )}
+      {dirty && !drawing && canEdit && (
+        <p className="text-[10px] text-amber-400 mt-2">Unsaved changes. Click "Save zones" to start counting them.</p>
+      )}
+
       {drawing && (
         <p className="text-[10px] text-brand-400 mt-2 animate-pulse">
           Click to add points • Minimum 3 points to complete a zone
@@ -256,14 +307,43 @@ export default function ZoneEditor({ frameData, frameWidth = 640, frameHeight = 
                 className="w-3 h-3 rounded-full shrink-0"
                 style={{ background: zoneColors[zone.type]?.stroke }}
               />
-              <span className="font-medium t-heading flex-1">{zone.name}</span>
-              <span className="text-[10px] t-muted">{zone.points.length} pts</span>
-              <button
-                onClick={(e) => { e.stopPropagation(); deleteZone(i); }}
-                className="p-1 rounded hover:bg-red-500/20 hover:text-red-400 transition-colors t-muted"
-              >
-                <Trash2 size={12} />
-              </button>
+              {canEdit ? (
+                <input
+                  className="input-field !py-1 !px-2 text-xs flex-1 min-w-0"
+                  value={zone.name}
+                  onClick={(e) => e.stopPropagation()}
+                  onChange={(e) => updateZone(i, { name: e.target.value })}
+                />
+              ) : (
+                <span className="font-medium t-heading flex-1">{zone.name}</span>
+              )}
+              <span className="text-[10px] t-muted">{zoneColors[zone.type]?.label}</span>
+              {zone.type !== 'restricted' && (
+                <label className="flex items-center gap-1 text-[10px] t-muted" onClick={(e) => e.stopPropagation()}>
+                  cap
+                  <input
+                    type="number" min="1" disabled={!canEdit}
+                    className="input-field !py-1 !px-1 text-xs w-14"
+                    value={zone.capacity ?? DEFAULT_CAPACITY[zone.type]}
+                    onChange={(e) => updateZone(i, { capacity: e.target.value === '' ? '' : Number(e.target.value) })}
+                  />
+                </label>
+              )}
+              {liveByName[zone.name] && !dirty && (
+                <span className={`text-[10px] font-semibold ${
+                  liveByName[zone.name].risk === 'high' ? 'text-red-400'
+                    : liveByName[zone.name].risk === 'medium' ? 'text-amber-400' : 'text-emerald-400'}`}>
+                  {liveByName[zone.name].people_count} now
+                </span>
+              )}
+              {canEdit && (
+                <button
+                  onClick={(e) => { e.stopPropagation(); deleteZone(i); }}
+                  className="p-1 rounded hover:bg-red-500/20 hover:text-red-400 transition-colors t-muted"
+                >
+                  <Trash2 size={12} />
+                </button>
+              )}
             </div>
           ))}
         </div>

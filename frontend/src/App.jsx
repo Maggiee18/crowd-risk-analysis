@@ -19,6 +19,8 @@ import ControlPanel from './components/ControlPanel';
 import SimulationPanel from './components/SimulationPanel';
 import HeatmapPanel from './components/HeatmapPanel';
 import LoginPage from './components/LoginPage';
+import UserManagement from './components/UserManagement';
+import NotificationSettings from './components/NotificationSettings';
 
 // New Feature Components
 import IncidentReport from './components/IncidentReport';
@@ -39,7 +41,18 @@ import * as api from './services/api';
 
 function App() {
   // ── Auth ─────────────────────────────────────────────────────
-  const [isLoggedIn, setIsLoggedIn] = useState(false);
+  const [currentUser, setCurrentUser] = useState(() => {
+    const s = api.getSession();
+    return s ? s.user : null;
+  });
+  const isLoggedIn = !!currentUser;
+  const setIsLoggedIn = (v) => { if (!v) setCurrentUser(null); };
+
+  // Any request that comes back "not logged in" (expired token) logs out
+  useEffect(() => {
+    api.setUnauthorizedHandler(() => setCurrentUser(null));
+    return () => api.setUnauthorizedHandler(null);
+  }, []);
 
   // ── UI State ─────────────────────────────────────────────────
   const [activePage, setActivePage] = useState('dashboard');
@@ -74,6 +87,10 @@ function App() {
   const [alertHistory, setAlertHistory] = useState([]);
   const [history, setHistory] = useState([]);
   const [zones, setZones] = useState([]);
+  const [zoneDefs, setZoneDefs] = useState([]);
+  // When the latest analysed frame was captured (the smooth live view uses
+  // the age of the AI result to size its privacy blur)
+  const [overlay, setOverlay] = useState({ capturedAt: 0 });
   const [predictions, setPredictions] = useState({});
   const [suggestions, setSuggestions] = useState([]);
   const [privacyEnabled, setPrivacyEnabled] = useState(true);
@@ -140,15 +157,17 @@ function App() {
   // ═══════════════════════════════════════════════════════════════
   // FRAME HANDLER — called by VideoFeed for camera & uploaded video
   // ═══════════════════════════════════════════════════════════════
-  const handleFrameReady = useCallback(async (base64Frame, source) => {
+  const handleFrameReady = useCallback(async (base64Frame, source, opts = {}) => {
     // Guard: skip if still processing previous frame
     if (processingRef.current) return;
     processingRef.current = true;
     setIsProcessingFrame(true);
 
     try {
-      const res = await api.processFrame(base64Frame);
+      const capturedAt = performance.now();
+      const res = await api.processFrame(base64Frame, opts.returnFrame !== false);
       const d = res.data;
+      setOverlay({ capturedAt });
       // The backend returns the full pipeline result (detection, risk, anomaly, LSTM, RL, heatmap, alerts)
       applyFrameResult(d, base64Frame);
     } catch (e) {
@@ -245,9 +264,42 @@ function App() {
   const handleLogin = async (username, password) => {
     const res = await api.login(username, password);
     if (res.data.status === 'success') {
-      setIsLoggedIn(true);
+      api.setSession({ token: res.data.token, user: res.data.user, expires_at: res.data.expires_at });
+      setCurrentUser(res.data.user);
     } else {
       throw new Error('Login failed');
+    }
+  };
+
+  // Saved zone shapes for the Zone Editor
+  useEffect(() => {
+    if (!isLoggedIn || activePage !== 'zones') return;
+    api.getZoneDefinitions().then((r) => setZoneDefs(r.data.zones || [])).catch(() => {});
+  }, [isLoggedIn, activePage]);
+
+  const handleSaveZones = async (list) => {
+    const res = await api.saveZones(list);
+    setZoneDefs(res.data.zones || []);
+    const live = await api.getZones();
+    setZones(live.data.zones || []);
+  };
+
+  const handleLogout = () => {
+    api.setSession(null);
+    setCurrentUser(null);
+  };
+
+  const handleExportLogs = async () => {
+    try {
+      const res = await api.downloadLogs();
+      const url = URL.createObjectURL(res.data);
+      const a = document.createElement('a');
+      a.href = url;
+      a.download = 'crowd_risk_logs.json';
+      a.click();
+      URL.revokeObjectURL(url);
+    } catch (e) {
+      window.alert(api.errorMessage(e, 'Could not download logs'));
     }
   };
 
@@ -259,6 +311,7 @@ function App() {
       setInputSource('simulation');
     } catch (e) {
       console.error('Failed to start simulation:', e);
+      window.alert(api.errorMessage(e, 'Could not start the simulation'));
     }
   };
 
@@ -309,6 +362,10 @@ function App() {
     isProcessing: isProcessingFrame,
     inputSource,
     onSourceChange: handleSourceChange,
+    detections: currentState?.detections || [],
+    capturedAt: overlay.capturedAt,
+    peopleCount: currentState?.people_count ?? 0,
+    riskLevel: currentState?.risk_prediction?.risk_level || 'low',
   };
 
   // ── Main Dashboard ───────────────────────────────────────────
@@ -320,6 +377,9 @@ function App() {
         onPageChange={setActivePage}
         isConnected={isConnected}
         peopleCount={peopleCount}
+        user={currentUser}
+        onLogout={handleLogout}
+        onExportLogs={handleExportLogs}
       />
 
       {/* Main content */}
@@ -612,11 +672,15 @@ function App() {
         {/* ============ ZONES ============ */}
         {activePage === 'zones' && (
           <div className="max-w-3xl animate-fade-in space-y-4">
-            <ZoneEditor 
-              frameData={frameData} 
-              frameWidth={640} 
-              frameHeight={480} 
-              onZonesUpdate={() => {}} 
+            <ZoneEditor
+              frameData={frameData}
+              frameWidth={640}
+              frameHeight={480}
+              onZonesUpdate={() => {}}
+              initialZones={zoneDefs}
+              liveStats={zones}
+              canEdit={currentUser && currentUser.role === 'admin'}
+              onSave={handleSaveZones}
             />
             <ZoneMap zones={zones} />
           </div>
@@ -678,7 +742,7 @@ function App() {
 
         {/* ============ SETTINGS ============ */}
         {activePage === 'settings' && (
-          <div className="max-w-xl animate-fade-in">
+          <div className="max-w-2xl animate-fade-in">
             <div className="glass-card space-y-4">
               <h3 className="text-sm font-semibold t-heading">System Settings</h3>
               <div className="space-y-3">
@@ -714,6 +778,14 @@ function App() {
                 </div>
               </div>
             </div>
+            <div className="mt-4">
+              <UserManagement user={currentUser} onPasswordChanged={handleLogout} />
+            </div>
+            {currentUser && currentUser.role === 'admin' && (
+              <div className="mt-4">
+                <NotificationSettings />
+              </div>
+            )}
           </div>
         )}
       </main>

@@ -46,6 +46,7 @@ def fit_risk_predictor(feats, labels, feature_names) -> RiskPredictor:
     rp.model = RandomForestClassifier(n_estimators=300, max_depth=8, min_samples_leaf=5,
                                       random_state=42, n_jobs=-1)
     rp.model.fit(rp.scaler.transform(feats), rp.label_encoder.transform(labels))
+    rp.model.n_jobs = 1   # live use predicts one frame at a time
     rp.is_trained = True
     return rp
 

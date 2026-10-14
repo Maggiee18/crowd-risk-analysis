@@ -17,7 +17,7 @@ const navItems = [
   { id: 'settings', label: 'Settings', icon: Settings },
 ];
 
-export default function Sidebar({ activePage, onPageChange, isConnected, peopleCount }) {
+export default function Sidebar({ activePage, onPageChange, isConnected, peopleCount, user, onLogout, onExportLogs }) {
   return (
     <aside
       className="fixed left-0 top-0 h-screen w-64 backdrop-blur-xl flex flex-col z-50 transition-colors duration-300"
@@ -82,8 +82,19 @@ export default function Sidebar({ activePage, onPageChange, isConnected, peopleC
 
       {/* Footer */}
       <div className="p-4 space-y-2" style={{ borderTop: '1px solid var(--card-border)' }}>
-        <button className="btn-ghost w-full justify-start text-xs">
-          <Download size={14} /> Export Logs
+        {user && (
+          <p className="text-[11px] t-muted px-1">
+            Signed in as <span className="t-body font-semibold">{user.username}</span>
+            <span className="capitalize"> · {user.role}</span>
+          </p>
+        )}
+        {user && user.role === 'admin' && (
+          <button className="btn-ghost w-full justify-start text-xs" onClick={onExportLogs}>
+            <Download size={14} /> Export Logs
+          </button>
+        )}
+        <button className="btn-ghost w-full justify-start text-xs" onClick={onLogout}>
+          <LogOut size={14} /> Sign out
         </button>
         <p className="text-[10px] t-muted text-center">v2.0 • AI-Powered</p>
       </div>

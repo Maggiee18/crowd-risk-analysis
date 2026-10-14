@@ -74,6 +74,55 @@ def load_perspective(path: str) -> np.ndarray:
         return np.ones((EMB_H * EMB_W, 1), dtype=np.float32)
 
 
+_OV_BACKBONES = {}
+
+
+def _backbone_module(yolo):
+    """Torch module: frame tensor -> per-cell features (1, C, 30, 40)."""
+    import torch
+    import torch.nn.functional as F
+
+    layers = yolo.model.model
+
+    class Backbone(torch.nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.layers = torch.nn.ModuleList([layers[i] for i in range(10)])
+
+        def forward(self, x):
+            outs = []
+            for layer in self.layers:
+                x = layer(x)
+                outs.append(x)
+            f8 = F.avg_pool2d(outs[4], 2)
+            f32 = F.interpolate(outs[9], size=(EMB_H, EMB_W), mode="bilinear", align_corners=False)
+            return torch.cat([f8, outs[6], f32], 1)
+
+    return Backbone().eval()
+
+
+def _openvino_backbone(yolo):
+    """
+    The same backbone compiled with OpenVINO (about 2x faster on CPU),
+    built once per model; None if OpenVINO is not installed.
+    """
+    key = id(yolo)
+    if key in _OV_BACKBONES:
+        return _OV_BACKBONES[key]
+    compiled = None
+    if os.environ.get("CROWDGUARD_ACCELERATE", "1") != "0":
+        try:
+            import openvino as ov
+            import torch
+            ov_model = ov.convert_model(_backbone_module(yolo),
+                                        example_input=torch.zeros(1, 3, EMB_SIZE[1], EMB_SIZE[0]))
+            compiled = ov.compile_model(ov_model, "CPU")
+        except Exception:
+            compiled = None
+    _OV_BACKBONES[key] = compiled
+    return compiled
+
+
 def frame_embedding(yolo, frame: np.ndarray, persp: np.ndarray) -> np.ndarray:
     """
     Run YOLO's backbone (layers 0-9) on the frame and return the per-frame
@@ -81,20 +130,16 @@ def frame_embedding(yolo, frame: np.ndarray, persp: np.ndarray) -> np.ndarray:
     averaged over the 30x40 grid. `yolo` is an ultralytics.YOLO object.
     """
     import torch
-    import torch.nn.functional as F
 
     img = cv2.resize(frame, EMB_SIZE) if frame.shape[:2] != (EMB_SIZE[1], EMB_SIZE[0]) else frame
-    x = torch.from_numpy(cv2.cvtColor(img, cv2.COLOR_BGR2RGB)).permute(2, 0, 1).float().unsqueeze(0) / 255
-    layers = yolo.model.model
-    outs = {}
-    with torch.no_grad():
-        for i in range(10):
-            x = layers[i](x)
-            outs[i] = x
-        f8 = F.avg_pool2d(outs[4], 2)[0]
-        f16 = outs[6][0]
-        f32 = F.interpolate(outs[9], size=(EMB_H, EMB_W), mode="bilinear", align_corners=False)[0]
-        cells = torch.cat([f8, f16, f32], 0).reshape(-1, EMB_H * EMB_W).T.numpy()
+    rgb = cv2.cvtColor(img, cv2.COLOR_BGR2RGB).transpose(2, 0, 1)[None].astype(np.float32) / 255
+    fast = _openvino_backbone(yolo)
+    if fast is not None:
+        feat = fast(rgb)[0][0]
+    else:
+        with torch.no_grad():
+            feat = _backbone_module(yolo)(torch.from_numpy(rgb))[0].numpy()
+    cells = feat.reshape(-1, EMB_H * EMB_W).T
     cells = np.concatenate([cells, cells * persp, np.ones((len(cells), 1), np.float32), persp], 1)
     return cells.mean(0).astype(np.float32)
 

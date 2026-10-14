@@ -50,7 +50,8 @@ EXPOSE 8000
 
 # Environment
 ENV PYTHONUNBUFFERED=1
-ENV ADMIN_TOKEN=crowd2024admin
+# Accounts live in /app/data (mounted volume). Set CROWDGUARD_ADMIN_PASSWORD
+# for the first start, or read the generated one from the container log.
 
 # Start FastAPI
 CMD ["uvicorn", "api.main:app", "--host", "0.0.0.0", "--port", "8000"]

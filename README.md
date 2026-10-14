@@ -18,12 +18,13 @@ A production-ready, real-time AI system for crowd detection, risk prediction, be
 | **Live Dashboard** | React + Tailwind + Recharts |
 | **Real-time Streaming** | FastAPI + WebSocket |
 | **Simulation Mode** | 6 crowd scenarios |
-| **Admin Auth** | Token-based login |
+| **Accounts** | Hashed passwords, expiring signed tokens, admin and viewer roles |
 | **Incident Reports** | Automated HTML Snapshot Gen |
 | **Natural Language AI** | Pattern-matching NL query |
 | **Sentiment Estimation** | Multi-factor heuristic mapping |
 | **Audio Alert System** | Web Audio API synthetic tones |
-| **Geofence Zone Editor** | HTML Canvas interactive map |
+| **Phone/Email Alerts** | Telegram bot and SMTP email with camera snapshot |
+| **Zones** | Draw named zones with capacities; per-zone counts and alerts |
 
 ## 📁 Project Structure
 
@@ -98,6 +99,64 @@ You can start a simulation from the dashboard or via API:
 
 ```bash
 curl -X POST http://localhost:8000/api/simulate -H "Content-Type: application/json" -d '{"scenario": "sudden_surge"}'
+```
+
+## ⚡ Speed
+
+Measured per frame on a 2-core cloud CPU. A typical laptop with more cores is faster.
+
+| Stage | Before | Now | How |
+|---|---|---|---|
+| YOLO detection | 407 ms | 203 ms | OpenVINO copy of the same network at the frame's real shape (1280×960); boxes identical |
+| Optical flow | 98 ms | 31 ms | Flow computed at half resolution; motion sums vectorised; models retrained on it |
+| Risk model | 154 ms | 28 ms | One prediction per frame no longer spread over all cores; single pass |
+| Count image features | 67 ms | 24 ms | Backbone compiled with OpenVINO |
+| Anomaly model | 40 ms | 18 ms | Single scoring pass |
+| **Total** | **774 ms (1.3 fps)** | **310 ms (3.2 fps)** | Same accuracy: count error 1.45 and risk 54/60 on the same unseen frames |
+
+The OpenVINO model is exported automatically on first start (about 2 seconds) when `openvino` is installed. Without it, CrowdGuard silently uses PyTorch. Set `CROWDGUARD_ACCELERATE=0` to force PyTorch.
+
+**Smooth live view:** for camera and uploaded video, the dashboard draws the video itself at full frame rate and puts the latest AI boxes on top. Before, it only showed each processed frame when it came back. With privacy on, heads are pixelated in the live view, with padding that grows with the age of the AI result. People the AI misses are not pixelated, so for strict privacy switch **Smooth view** off to see the server-processed frames instead.
+
+## 🗺️ Zones
+
+Draw zones over the camera view in **Zone Map → Zone Editor**. As an admin, give each zone a name, a type and a capacity, then click **Save zones**. From then on every frame counts people per zone and raises alerts that name the zone:
+
+| Zone type | Alert |
+|---|---|
+| Monitor / Entry | WARNING at 80% of capacity, CRITICAL when over capacity |
+| Exit | "Exit 'North exit' is congested", CRITICAL when over capacity |
+| Restricted | CRITICAL as soon as anyone is inside |
+
+People are placed by where their feet are (the bottom of their box), which matches where they stand on the floor. Zone counts are scaled to agree with the corrected total count. Zones are saved in `data/zones.json`. Without any zones the dashboard shows the old 3×3 grid. Tests are in `tests/test_zones.py`.
+
+## 📲 Phone and Email Alerts
+
+Critical alerts (panic, evacuation, over capacity, restricted zone, and so on) can be sent to **Telegram** and/or **email**, each with a snapshot of the camera frame with people boxed and zones drawn.
+
+Set it up in **Settings → Notifications** (admin only):
+
+- **Telegram:** open @BotFather, send `/newbot` and paste the token. Send your bot any message, click **Find my chat ID**, then **Send test**.
+- **Email:** any SMTP server. For Gmail use `smtp.gmail.com`, port 587 and an app password.
+
+Each kind of alert (and each zone) is sent when it starts, then at most once per cooldown (5 minutes by default) while it continues. Sending happens in the background, so a slow network never slows the camera. Settings are saved in `data/notify.json` (git-ignored, secrets never shown back in the dashboard). They can also be set through environment variables such as `CROWDGUARD_TELEGRAM_TOKEN` and `CROWDGUARD_SMTP_HOST`. Tests are in `tests/test_notifier.py`.
+
+## 🔐 Accounts and Login
+
+Every API endpoint and the live WebSocket require a login. The only exceptions are `POST /api/auth/login` and the `/api/status` health check.
+
+- **First start:** an `admin` account is created. Its password comes from the `CROWDGUARD_ADMIN_PASSWORD` environment variable, or a random one is printed **once** in the backend window. Sign in and change it under Settings → Accounts.
+- **Roles:** `admin` can run simulations, change settings, download logs, retrain and manage accounts. `viewer` can watch the dashboard and stream a camera.
+- **Security:** passwords are stored as salted scrypt hashes. Login tokens are signed (HMAC-SHA256) and expire after 12 hours (`CROWDGUARD_TOKEN_HOURS`). Changing a password signs out that user's other sessions. After 5 wrong passwords, login from that address pauses for a minute.
+- Accounts are kept in `data/users.json` and the signing key in `data/secret.key`. Both are git-ignored, so never commit them.
+
+Manage accounts from a terminal, even while the server is stopped:
+
+```bash
+python api/manage_users.py list
+python api/manage_users.py add guard1            # viewer by default
+python api/manage_users.py add maggie --role admin
+python api/manage_users.py password admin        # reset a forgotten password
 ```
 
 ## 🧠 Training on the Mall Dataset

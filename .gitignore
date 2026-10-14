@@ -6,3 +6,11 @@ output/
 .venv/
 frontend/dist/
 training/cache/
+
+# accounts and signing key (never commit)
+data/users.json
+data/secret.key
+data/notify.json
+
+# OpenVINO exports are generated automatically on first start
+*_openvino_model/

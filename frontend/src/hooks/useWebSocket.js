@@ -1,5 +1,6 @@
 // WebSocket hook for real-time connection management
 import { useState, useEffect, useRef, useCallback } from 'react';
+import { getToken } from '../services/api';
 
 const WS_URL = (import.meta.env && import.meta.env.VITE_WS_URL) || 'ws://localhost:8000/ws';
 
@@ -15,8 +16,15 @@ export function useWebSocket(onMessage) {
   const connect = useCallback(() => {
     if (wsRef.current?.readyState === WebSocket.OPEN) return;
 
+    // The server only accepts logged-in clients; wait until there is a token
+    const token = getToken();
+    if (!token) {
+      reconnectTimeout.current = setTimeout(connect, 2000);
+      return;
+    }
+
     try {
-      const ws = new WebSocket(WS_URL);
+      const ws = new WebSocket(`${WS_URL}?token=${encodeURIComponent(token)}`);
 
       ws.onopen = () => {
         setIsConnected(true);

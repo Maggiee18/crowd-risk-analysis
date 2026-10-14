@@ -10,6 +10,40 @@ export default function ZoneMap({ zones = [] }) {
     }
   };
 
+  // Zones drawn in the Zone Editor have shapes; show them by name
+  const custom = zones.length > 0 && zones[0].points;
+  if (custom) {
+    const typeLabel = { monitor: 'Monitor', entry: 'Entry', exit: 'Exit', restricted: 'Restricted' };
+    return (
+      <div className="glass-card">
+        <div className="flex items-center gap-2 mb-4">
+          <Map size={18} className="text-cyan-400" />
+          <h3 className="text-sm font-semibold t-heading">Zone Analysis</h3>
+        </div>
+        <div className="grid grid-cols-2 sm:grid-cols-3 gap-2">
+          {zones.map((zone) => {
+            const colors = getColor(zone.risk);
+            return (
+              <div key={zone.id || zone.name}
+                   className={`zone-cell ${zone.risk} p-3 shadow-lg ${colors.glow} transition-all duration-500`}>
+                <span className="text-[10px] t-muted mb-1 truncate max-w-full">{zone.name}</span>
+                <span className={`text-lg font-bold ${colors.text}`}>
+                  {zone.people_count || 0}
+                  {zone.type !== 'restricted' && zone.capacity > 0 && (
+                    <span className="text-[10px] t-muted font-normal"> / {zone.capacity}</span>
+                  )}
+                </span>
+                <span className={`text-[9px] uppercase font-semibold mt-0.5 ${colors.text}`}>
+                  {typeLabel[zone.type] || zone.type} · {zone.risk}
+                </span>
+              </div>
+            );
+          })}
+        </div>
+      </div>
+    );
+  }
+
   // 3x3 grid
   const grid = [];
   for (let r = 0; r < 3; r++) {

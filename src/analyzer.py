@@ -240,17 +240,13 @@ class CrowdAnalyzer:
     
     def _calculate_movement_concentration(self, magnitude: np.ndarray) -> float:
         """Calculate how concentrated the movement is in certain areas"""
-        # Create spatial bins
+        # Sum movement in each 10x10 pixel cell (vectorised; same result as
+        # looping over the cells, ~10x faster)
         h, w = magnitude.shape
         grid_h, grid_w = h // 10, w // 10
-        
-        # Sum movement in each grid cell
-        grid_movement = np.zeros((grid_h, grid_w))
-        for i in range(grid_h):
-            for j in range(grid_w):
-                h_start, h_end = i * 10, min((i + 1) * 10, h)
-                w_start, w_end = j * 10, min((j + 1) * 10, w)
-                grid_movement[i, j] = np.sum(magnitude[h_start:h_end, w_start:w_end])
+        if grid_h == 0 or grid_w == 0:
+            return 0.0
+        grid_movement = magnitude[:grid_h * 10, :grid_w * 10].reshape(grid_h, 10, grid_w, 10).sum(axis=(1, 3))
         
         # Calculate concentration (how unevenly distributed the movement is)
         total_movement = np.sum(grid_movement)

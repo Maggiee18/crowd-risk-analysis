@@ -17,6 +17,7 @@ from collections import deque
 import cv2
 import numpy as np
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect, HTTPException, Depends
+from fastapi import Header, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import StreamingResponse, JSONResponse
 from pydantic import BaseModel
@@ -35,6 +36,9 @@ from mall_models import load_mall_models
 from tracker import PersonTracker
 from panic_detector import PanicDetector
 from evacuation_detector import EvacuationDetector
+from auth import UserStore, AuthError, ROLES
+from zones import ZoneManager, zone_alerts
+from notifier import Notifier
 from lstm_predictor import LSTMCrowdPredictor
 from rl_controller import CrowdControlAgent
 from privacy import PrivacyFilter
@@ -104,8 +108,15 @@ class SystemState:
         # WebSocket clients
         self.ws_clients: List[WebSocket] = []
 
-        # Auth (simple token-based)
-        self.admin_token = os.environ.get("ADMIN_TOKEN", "crowd2024admin")
+        # Accounts and login tokens (see src/auth.py)
+        data_dir = os.environ.get("CROWDGUARD_DATA_DIR",
+                                  os.path.join(os.path.dirname(__file__), '..', 'data'))
+        self.users = UserStore(data_dir)
+        # Zones drawn in the dashboard (see src/zones.py)
+        self.zones = ZoneManager(os.path.join(data_dir, 'zones.json'))
+        self.current_zone_stats: List[Dict] = []
+        # Telegram / email notifications for critical alerts (see src/notifier.py)
+        self.notifier = Notifier(os.path.join(data_dir, 'notify.json'))
 
 state = SystemState()
 
@@ -116,6 +127,14 @@ async def startup():
     """Initialize all system components on startup."""
     try:
         logger.info("Initializing Crowd Risk Detection System …")
+
+        generated = state.users.ensure_admin()
+        if generated:
+            logger.warning("=" * 60)
+            logger.warning("First start: created user 'admin' with password: %s", generated)
+            logger.warning("Log in and change it, or set CROWDGUARD_ADMIN_PASSWORD")
+            logger.warning("before the first start. This is shown only once.")
+            logger.warning("=" * 60)
 
         model_dir = os.path.join(os.path.dirname(__file__), '..', 'models')
         os.makedirs(model_dir, exist_ok=True)
@@ -211,6 +230,10 @@ def _load_trained_models(model_dir: str):
 # ─── Pydantic models ─────────────────────────────────────────────
 class FrameInput(BaseModel):
     image: str  # base64 encoded
+    # The dashboard's smooth view draws the live video itself and only needs
+    # the analysis, so it can skip the processed image (saves a JPEG encode
+    # and ~60 KB per frame)
+    return_frame: bool = True
 
 class SimulationRequest(BaseModel):
     scenario: str = 'normal'
@@ -224,9 +247,25 @@ class TrainRequest(BaseModel):
     n_scenarios: int = 30
 
 
-# ─── Auth helper ─────────────────────────────────────────────────
-def verify_token(token: str) -> bool:
-    return token == state.admin_token
+# ─── Auth helpers ────────────────────────────────────────────────
+def current_user(authorization: Optional[str] = Header(None)) -> Dict:
+    """Any logged-in user. Expects 'Authorization: Bearer <token>'."""
+    token = (authorization or "").removeprefix("Bearer ").strip()
+    try:
+        return state.users.verify_token(token)
+    except AuthError as e:
+        raise HTTPException(status_code=401, detail=str(e))
+
+
+def admin_user(user: Dict = Depends(current_user)) -> Dict:
+    """Logged-in admin only (controls the system, manages users)."""
+    if user["role"] != "admin":
+        raise HTTPException(status_code=403, detail="Admin only")
+    return user
+
+
+LOGGED_IN = [Depends(current_user)]
+ADMIN_ONLY = [Depends(admin_user)]
 
 
 # ─── REST API Endpoints ─────────────────────────────────────────
@@ -256,7 +295,7 @@ async def get_status():
     }
 
 
-@app.post("/api/process_frame")
+@app.post("/api/process_frame", dependencies=LOGGED_IN)
 async def process_frame(data: FrameInput):
     """Process a single base64-encoded frame and return full AI analysis."""
     if not state.initialized:
@@ -267,7 +306,7 @@ async def process_frame(data: FrameInput):
 
         # Encode the stored frame (with privacy filter) back to base64
         # so the frontend can display the processed view
-        if state.current_frame is not None:
+        if data.return_frame and state.current_frame is not None:
             display_frame = state.current_frame.copy()
 
             # Draw detection bounding boxes on the frame
@@ -313,7 +352,7 @@ async def process_frame(data: FrameInput):
 
 
 
-@app.get("/api/current_state")
+@app.get("/api/current_state", dependencies=LOGGED_IN)
 async def get_current_state():
     """Get the latest analysis results."""
     frame_b64 = None
@@ -342,7 +381,7 @@ async def get_current_state():
     }
 
 
-@app.get("/api/alerts")
+@app.get("/api/alerts", dependencies=LOGGED_IN)
 async def get_alerts():
     """Get current and recent alerts."""
     return {
@@ -353,7 +392,7 @@ async def get_alerts():
     }
 
 
-@app.get("/api/history")
+@app.get("/api/history", dependencies=LOGGED_IN)
 async def get_history(limit: int = 100):
     """Get historical data for charts."""
     data = list(state.history)[-limit:]
@@ -364,7 +403,7 @@ async def get_history(limit: int = 100):
     }
 
 
-@app.get("/api/predictions")
+@app.get("/api/predictions", dependencies=LOGGED_IN)
 async def get_predictions():
     """Get LSTM-based crowd predictions."""
     return {
@@ -373,7 +412,7 @@ async def get_predictions():
     }
 
 
-@app.get("/api/control_suggestions")
+@app.get("/api/control_suggestions", dependencies=LOGGED_IN)
 async def get_control_suggestions():
     """Get RL-based crowd control suggestions."""
     return {
@@ -382,11 +421,15 @@ async def get_control_suggestions():
     }
 
 
-@app.get("/api/zones")
+@app.get("/api/zones", dependencies=LOGGED_IN)
 async def get_zones():
-    """Get zone-based analysis."""
+    """Live per-zone counts. Uses the zones drawn in the dashboard, or a
+    3x3 grid when none have been drawn yet."""
+    if state.zones.zones:
+        stats = state.current_zone_stats or state.zones.analyze(state.current_detections)
+        return {"zones": stats, "custom": True, "timestamp": datetime.now().isoformat()}
+
     zones = generate_zone_grid((480, 640), rows=3, cols=3)
-    # Assign detections to zones
     for zone in zones:
         zone_dets = [
             d for d in state.current_detections
@@ -404,10 +447,31 @@ async def get_zones():
         else:
             zone['risk'] = 'low'
 
-    return {"zones": zones, "timestamp": datetime.now().isoformat()}
+    return {"zones": zones, "custom": False, "timestamp": datetime.now().isoformat()}
 
 
-@app.get("/api/scenarios")
+class ZonesUpdate(BaseModel):
+    zones: List[Dict[str, Any]]
+
+
+@app.get("/api/zones/definitions", dependencies=LOGGED_IN)
+async def get_zone_definitions():
+    """The saved zone shapes, types and capacities (for the Zone Editor)."""
+    return {"zones": state.zones.zones}
+
+
+@app.put("/api/zones", dependencies=ADMIN_ONLY)
+async def save_zones(req: ZonesUpdate):
+    """Replace all zones (admin only)."""
+    try:
+        saved = state.zones.set_zones(req.zones)
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+    state.current_zone_stats = state.zones.analyze(state.current_detections)
+    return {"status": "saved", "zones": saved}
+
+
+@app.get("/api/scenarios", dependencies=LOGGED_IN)
 async def get_scenarios():
     """Get available simulation scenarios."""
     if state.simulator:
@@ -415,7 +479,7 @@ async def get_scenarios():
     return {"scenarios": {}}
 
 
-@app.post("/api/simulate")
+@app.post("/api/simulate", dependencies=ADMIN_ONLY)
 async def start_simulation(req: SimulationRequest):
     """Start a simulation scenario."""
     if not state.simulator:
@@ -450,7 +514,7 @@ async def start_simulation(req: SimulationRequest):
     }
 
 
-@app.post("/api/simulate/stop")
+@app.post("/api/simulate/stop", dependencies=ADMIN_ONLY)
 async def stop_simulation():
     """Stop the running simulation."""
     state.simulation_active = False
@@ -460,19 +524,111 @@ async def stop_simulation():
 
 
 @app.post("/api/auth/login")
-async def login(req: LoginRequest):
-    """Simple admin authentication."""
-    # Simple hardcoded auth for demo
-    if req.username.strip() == "admin" and req.password.strip() == "admin123":
-        return {
-            "status": "success",
-            "token": state.admin_token,
-            "user": {"username": "admin", "role": "administrator"}
-        }
-    raise HTTPException(status_code=401, detail="Invalid credentials")
+async def login(req: LoginRequest, request: Request):
+    """Log in with a username and password; returns a token that expires."""
+    client = request.client.host if request.client else "?"
+    try:
+        result = state.users.login(req.username, req.password, client=client)
+    except AuthError as e:
+        code = 429 if "Too many" in str(e) else 401
+        raise HTTPException(status_code=code, detail=str(e))
+    logger.info(f"User '{result['user']['username']}' logged in from {client}")
+    return {"status": "success", **result}
 
 
-@app.post("/api/train/lstm")
+@app.get("/api/auth/me")
+async def who_am_i(user: Dict = Depends(current_user)):
+    return {"user": user}
+
+
+class PasswordChange(BaseModel):
+    old_password: str
+    new_password: str
+
+
+@app.post("/api/auth/password")
+async def change_password(req: PasswordChange, request: Request, user: Dict = Depends(current_user)):
+    """Change your own password (also logs out your other sessions)."""
+    try:
+        state.users.login(user["username"], req.old_password,
+                          client=request.client.host if request.client else "?")
+        state.users.set_password(user["username"], req.new_password)
+    except AuthError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+    return {"status": "changed", "message": "Password changed. Please log in again."}
+
+
+class NewUser(BaseModel):
+    username: str
+    password: str
+    role: str = "viewer"
+
+
+@app.get("/api/auth/users", dependencies=ADMIN_ONLY)
+async def list_users():
+    return {"users": state.users.list_users(), "roles": list(ROLES)}
+
+
+@app.post("/api/auth/users", dependencies=ADMIN_ONLY)
+async def create_user(req: NewUser):
+    try:
+        state.users.add_user(req.username, req.password, req.role)
+    except AuthError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+    return {"status": "created", "users": state.users.list_users()}
+
+
+@app.delete("/api/auth/users/{username}")
+async def remove_user(username: str, user: Dict = Depends(admin_user)):
+    if username == user["username"]:
+        raise HTTPException(status_code=400, detail="You cannot delete your own account")
+    try:
+        state.users.delete_user(username)
+    except AuthError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+    return {"status": "deleted", "users": state.users.list_users()}
+
+
+class NotifySettings(BaseModel):
+    settings: Dict[str, Any]
+
+
+@app.get("/api/notify", dependencies=ADMIN_ONLY)
+async def get_notify_settings():
+    """Notification settings (secrets masked) and recent send results."""
+    return state.notifier.public_config()
+
+
+@app.put("/api/notify", dependencies=ADMIN_ONLY)
+async def update_notify_settings(req: NotifySettings):
+    try:
+        return state.notifier.update(req.settings)
+    except (ValueError, TypeError) as e:
+        raise HTTPException(status_code=400, detail=str(e))
+
+
+@app.post("/api/notify/test", dependencies=ADMIN_ONLY)
+async def send_test_notification():
+    """Send a test message to every configured channel and report the result."""
+    if not (state.notifier.telegram_ready or state.notifier.email_ready):
+        raise HTTPException(status_code=400, detail="Set up Telegram or email first")
+    result = await asyncio.to_thread(state.notifier.send_test)
+    return {"result": result}
+
+
+@app.post("/api/notify/telegram/find_chat", dependencies=ADMIN_ONLY)
+async def find_telegram_chat():
+    """After you send any message to your bot, this finds your chat id."""
+    try:
+        chat = await asyncio.to_thread(state.notifier.find_telegram_chat_id)
+    except Exception as e:
+        raise HTTPException(status_code=400, detail=f"Could not reach Telegram: {e}")
+    if not chat:
+        raise HTTPException(status_code=404, detail="No messages yet. Send any message to your bot, then try again.")
+    return state.notifier.update({"telegram_chat_id": chat})
+
+
+@app.post("/api/train/lstm", dependencies=ADMIN_ONLY)
 async def train_lstm(req: TrainRequest):
     """Train/retrain the LSTM predictor."""
     if not state.lstm_predictor:
@@ -482,7 +638,7 @@ async def train_lstm(req: TrainRequest):
     return {"status": "trained", "result": result}
 
 
-@app.post("/api/train/rl")
+@app.post("/api/train/rl", dependencies=ADMIN_ONLY)
 async def train_rl():
     """Train/retrain the RL control agent."""
     if not state.rl_agent:
@@ -492,7 +648,7 @@ async def train_rl():
     return {"status": "trained", "result": result}
 
 
-@app.get("/api/privacy/toggle")
+@app.get("/api/privacy/toggle", dependencies=ADMIN_ONLY)
 async def toggle_privacy(enabled: Optional[bool] = None):
     """Toggle privacy filter (face blurring)."""
     if state.privacy_filter:
@@ -504,7 +660,7 @@ async def toggle_privacy(enabled: Optional[bool] = None):
     return {"enabled": False}
 
 
-@app.get("/api/logs/download")
+@app.get("/api/logs/download", dependencies=ADMIN_ONLY)
 async def download_logs():
     """Download system logs as JSON."""
     log_data = {
@@ -538,7 +694,12 @@ async def download_logs():
 # ─── WebSocket ───────────────────────────────────────────────────
 @app.websocket("/ws")
 async def websocket_endpoint(ws: WebSocket):
-    """WebSocket endpoint for real-time updates."""
+    """WebSocket endpoint for real-time updates. Connect with ?token=<login token>."""
+    try:
+        state.users.verify_token(ws.query_params.get("token", ""))
+    except AuthError:
+        await ws.close(code=1008)   # policy violation: not logged in
+        return
     await ws.accept()
     state.ws_clients.append(ws)
     logger.info(f"WebSocket client connected ({len(state.ws_clients)} total)")
@@ -585,6 +746,29 @@ async def broadcast_ws(data: dict):
 
 
 # ─── Frame Processing Core ──────────────────────────────────────
+def _snapshot_jpeg(frame: np.ndarray, detections: List[Dict], count: int) -> Optional[bytes]:
+    """Camera frame with people boxed, for notifications. Faces are blurred
+    when the privacy filter is on."""
+    try:
+        img = frame.copy()
+        if state.privacy_filter and state.privacy_filter.enabled:
+            img = state.privacy_filter.blur_faces(img)
+        for d in detections[:200]:
+            x1, y1, x2, y2 = [int(v) for v in d['bbox']]
+            cv2.rectangle(img, (x1, y1), (x2, y2), (0, 0, 255), 2)
+        for z in state.current_zone_stats:
+            pts = np.array(z['points'], dtype=np.int32).reshape(-1, 1, 2)
+            cv2.polylines(img, [pts], True, (0, 200, 255), 2)
+        cv2.rectangle(img, (0, 0), (img.shape[1], 34), (0, 0, 0), -1)
+        cv2.putText(img, f"{count} people  {datetime.now():%H:%M:%S}", (10, 24),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 255, 255), 2)
+        ok, buf = cv2.imencode('.jpg', img, [cv2.IMWRITE_JPEG_QUALITY, 80])
+        return buf.tobytes() if ok else None
+    except Exception as e:
+        logger.warning(f"Snapshot failed: {e}")
+        return None
+
+
 def _reset_stream_state(source: str):
     """
     Forget all per-stream history: trends, tracks, motion baseline, forecast
@@ -665,6 +849,10 @@ def _process_raw_frame(frame: np.ndarray, sim_detections=None, frames_elapsed: f
     evacuation = {}
     if state.evacuation_detector is not None:
         evacuation = state.evacuation_detector.update(count, t_now)
+
+    # 2d. Per-zone counts for the zones drawn in the dashboard
+    zone_stats = state.zones.analyze(detections, total_count=count)
+    state.current_zone_stats = zone_stats
 
     # 3. Analyze crowd features (count may be calibrated by the count corrector)
     features = state.analyzer.update_frame(frame, detections, people_count=count)
@@ -752,11 +940,18 @@ def _process_raw_frame(frame: np.ndarray, sim_detections=None, frames_elapsed: f
     alerts = []
     if state.alert_system:
         raw_alerts = state.alert_system.evaluate_risk(risk_result, anomaly_result, {**features, 'panic': panic, 'evacuation': evacuation})
+        raw_alerts += zone_alerts(zone_stats, time.time())
         # Copy before making serializable: AlertSystem keeps the originals in
         # active_alerts and later does `now - alert['timestamp']`, which
         # crashed with "float - str" once the timestamp became a string.
         alerts = [{**a, 'timestamp': datetime.now().isoformat()} for a in raw_alerts]
         state.alert_log.extend(alerts)
+
+        # Phone / email notifications (cooldown per alert kind, sent in background)
+        to_send = state.notifier.wants(alerts)
+        if to_send:
+            state.notifier.notify(to_send, _snapshot_jpeg(frame, detections, count),
+                                  context='simulation' if sim_detections is not None else 'live camera')
 
     proc_time = time.time() - start
     fps = 1.0 / proc_time if proc_time > 0 else 0
@@ -817,6 +1012,7 @@ def _process_raw_frame(frame: np.ndarray, sim_detections=None, frames_elapsed: f
         'alerts': alerts,
         'panic': panic,
         'evacuation': evacuation,
+        'zones': zone_stats,
         'tracking_summary': {
             k: (float(v) if isinstance(v, (np.floating, np.integer)) else v)
             for k, v in tracking_summary.items()
